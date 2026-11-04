@@ -1,6 +1,5 @@
 use datafusion::common::runtime::SpawnedTask;
 use datafusion::logical_expr::LogicalPlan;
-use datafusion::physical_plan::ExecutionPlanProperties;
 use futures::StreamExt;
 use log::info;
 use std::{sync::Arc, time::Duration};
@@ -228,7 +227,6 @@ impl DataStream {
     pub async fn print_physical_plan(self) -> Result<Self> {
         let (session_state, plan) = self.df.as_ref().clone().into_parts();
         let physical_plan = self.df.as_ref().clone().create_physical_plan().await?;
-        // let node_id = physical_plan.node_id();
         let displayable_plan = DisplayableExecutionPlan::new(physical_plan.as_ref());
 
         println!("{}", displayable_plan.indent(true));
@@ -346,9 +344,7 @@ impl DataStream {
     pub async fn sink_kafka(self, bootstrap_servers: String, topic: String) -> Result<()> {
         self.clone()
             .with_orchestrator(|_shutdown_rx| async move {
-                let processed_schema = Arc::new(
-                    datafusion::common::arrow::datatypes::Schema::from(self.df.schema()),
-                );
+                let processed_schema = Arc::new(self.df.schema().as_arrow().clone());
 
                 let sink_topic = KafkaTopicBuilder::new(bootstrap_servers.clone())
                     .with_timestamp(String::from("occurred_at_ms"), TimestampUnit::Int64Millis)

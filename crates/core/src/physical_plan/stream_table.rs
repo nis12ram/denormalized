@@ -17,7 +17,6 @@
 
 //! Generic plans for deferred execution: [`StreamingTableExec`] and [`PartitionStream`]
 
-use std::any::Any;
 use std::sync::Arc;
 
 //use super::{DisplayAs, DisplayFormatType, ExecutionMode, PlanProperties};
@@ -31,11 +30,12 @@ use datafusion::{
     physical_expr::EquivalenceProperties,
     physical_plan::{
         display::{display_orderings, ProjectSchemaDisplay},
+        execution_plan::{Boundedness, EmissionType},
         limit::LimitStream,
         metrics::{BaselineMetrics, MetricsSet},
         stream::RecordBatchStreamAdapter,
         streaming::PartitionStream,
-        DisplayAs, DisplayFormatType, ExecutionMode, ExecutionPlan, Partitioning,
+        DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning,
     },
 };
 //use datafusion_execution::TaskContext;
@@ -46,7 +46,7 @@ use datafusion::{
 use async_trait::async_trait;
 use datafusion::{
     execution::{SendableRecordBatchStream, TaskContext},
-    physical_expr::LexOrdering,
+    physical_expr::{LexOrdering, PhysicalExpr},
     physical_plan::{metrics::ExecutionPlanMetricsSet, PlanProperties},
 };
 use futures::stream::StreamExt;
@@ -75,7 +75,8 @@ pub struct DenormalizedStreamingTableExec {
     projected_output_ordering: Vec<LexOrdering>,
     infinite: bool,
     limit: Option<usize>,
-    cache: PlanProperties,
+    cache: Arc<PlanProperties>,
+    node_id: Option<usize>,
     metrics: ExecutionPlanMetricsSet,
 }
 
@@ -119,6 +120,7 @@ impl DenormalizedStreamingTableExec {
             infinite,
             limit,
             cache,
+            node_id: None,
             metrics: ExecutionPlanMetricsSet::new(),
         })
     }
@@ -157,21 +159,28 @@ impl DenormalizedStreamingTableExec {
         orderings: &[LexOrdering],
         partitions: &[Arc<dyn PartitionStreamExt>],
         is_infinite: bool,
-    ) -> PlanProperties {
+    ) -> Arc<PlanProperties> {
         // Calculate equivalence properties:
-        let eq_properties = EquivalenceProperties::new_with_orderings(schema, orderings);
+        let eq_properties =
+            EquivalenceProperties::new_with_orderings(schema, orderings.iter().cloned());
 
         // Get output partitioning:
         let output_partitioning = Partitioning::UnknownPartitioning(partitions.len());
 
-        // Determine execution mode:
-        let mode = if is_infinite {
-            ExecutionMode::Unbounded
+        let boundedness = if is_infinite {
+            Boundedness::Unbounded {
+                requires_infinite_memory: false,
+            }
         } else {
-            ExecutionMode::Bounded
+            Boundedness::Bounded
         };
 
-        PlanProperties::new(eq_properties, output_partitioning, mode)
+        Arc::new(PlanProperties::new(
+            eq_properties,
+            output_partitioning,
+            EmissionType::Incremental,
+            boundedness,
+        ))
     }
 }
 
@@ -184,7 +193,9 @@ impl std::fmt::Debug for DenormalizedStreamingTableExec {
 impl DisplayAs for DenormalizedStreamingTableExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match t {
-            DisplayFormatType::Default | DisplayFormatType::Verbose => {
+            DisplayFormatType::Default
+            | DisplayFormatType::Verbose
+            | DisplayFormatType::TreeRender => {
                 write!(
                     f,
                     "DenormalizedStreamingTableExec: partition_sizes={:?}",
@@ -218,11 +229,7 @@ impl ExecutionPlan for DenormalizedStreamingTableExec {
         "DenormalizedStreamingTableExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.cache
     }
 
@@ -250,7 +257,17 @@ impl ExecutionPlan for DenormalizedStreamingTableExec {
         partition: usize,
         ctx: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
-        let stream = self.partitions[partition].execute(ctx);
+        let partition_stream = &self.partitions[partition];
+        let stream = if partition_stream.requires_node_id() {
+            if let Some(kafka_stream) = partition_stream.as_partition_with_node_id() {
+                let kafka_stream = kafka_stream.clone().with_node_id(self.node_id);
+                Arc::new(kafka_stream).execute(ctx)
+            } else {
+                partition_stream.execute(ctx)
+            }
+        } else {
+            partition_stream.execute(ctx)
+        };
         let projected_stream = match self.projection.clone() {
             Some(projection) => Box::pin(RecordBatchStreamAdapter::new(
                 Arc::clone(&self.projected_schema),
@@ -287,39 +304,33 @@ impl ExecutionPlan for DenormalizedStreamingTableExec {
             infinite: self.infinite,
             limit,
             cache: self.cache.clone(),
+            node_id: self.node_id,
             metrics: self.metrics.clone(),
         }))
     }
 
-    fn with_node_id(self: Arc<Self>, _node_id: usize) -> Result<Option<Arc<dyn ExecutionPlan>>> {
-        let new_partitions: Vec<Arc<dyn PartitionStreamExt>> = self
-            .partitions
-            .iter()
-            .map(|partition| {
-                if partition.requires_node_id() {
-                    if let Some(kafka_stream) = partition.as_partition_with_node_id() {
-                        let new_stream = kafka_stream.clone().with_node_id(Some(_node_id));
-                        Arc::new(new_stream) as Arc<dyn PartitionStreamExt>
-                    } else {
-                        Arc::clone(partition)
-                    }
-                } else {
-                    Arc::clone(partition)
-                }
-            })
-            .collect();
-        let mut new_plan = DenormalizedStreamingTableExec {
-            partitions: new_partitions,
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(
+            &Arc<dyn PhysicalExpr>,
+        ) -> Result<datafusion::common::tree_node::TreeNodeRecursion>,
+    ) -> Result<datafusion::common::tree_node::TreeNodeRecursion> {
+        Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+    }
+}
+
+impl DenormalizedStreamingTableExec {
+    pub fn with_node_id(&self, node_id: usize) -> Arc<dyn ExecutionPlan> {
+        Arc::new(DenormalizedStreamingTableExec {
+            partitions: self.partitions.clone(),
             projection: self.projection.clone(),
             projected_schema: Arc::clone(&self.projected_schema),
             projected_output_ordering: self.projected_output_ordering.clone(),
             infinite: self.infinite,
             limit: self.limit,
             cache: self.cache.clone(),
+            node_id: Some(node_id),
             metrics: self.metrics.clone(),
-        };
-        let new_props = new_plan.cache.clone().with_node_id(_node_id);
-        new_plan.cache = new_props;
-        Ok(Some(Arc::new(new_plan)))
+        })
     }
 }

@@ -6,7 +6,7 @@ use tokio::runtime::Runtime;
 
 /// Utility to get the Tokio Runtime from Python
 pub(crate) fn get_tokio_runtime(py: Python) -> PyRef<TokioRuntime> {
-    let datafusion = py.import_bound("denormalized._d_internal").unwrap();
+    let datafusion = py.import("denormalized._d_internal").unwrap();
     let tmp = datafusion.getattr("runtime").unwrap();
     match tmp.extract::<PyRef<TokioRuntime>>() {
         Ok(runtime) => runtime,
@@ -26,14 +26,14 @@ where
 {
     let runtime: &Runtime = &get_tokio_runtime(py).0;
     // allow_threads explicitly releases the GIL until the future returns
-    py.allow_threads(|| runtime.block_on(f))
+    py.detach(|| runtime.block_on(f))
 }
 
 /// Print a string to the python console
 pub fn python_print(py: Python, str: String) -> PyResult<()> {
     // Import the Python 'builtins' module to access the print function
     // Note that println! does not print to the Python debug console and is not visible in notebooks for instance
-    let print = py.import_bound("builtins")?.getattr("print")?;
+    let print = py.import("builtins")?.getattr("print")?;
     print.call1((str,))?;
     Ok(())
 }

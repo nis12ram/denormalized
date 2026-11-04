@@ -2,7 +2,7 @@ use std::{io::Cursor, sync::Arc};
 
 use arrow_array::RecordBatch;
 use arrow_schema::Schema;
-use datafusion::datasource::avro_to_arrow::ReaderBuilder;
+use datafusion::arrow_avro::reader::ReaderBuilder;
 use denormalized_common::DenormalizedError;
 
 use super::Decoder;
@@ -31,7 +31,6 @@ impl Decoder for AvroDecoder {
         // Build the reader
         let mut reader = ReaderBuilder::new()
             .with_batch_size(self.size)
-            .with_schema(self.schema.clone())
             .build(cursor)?;
 
         // Read the batch
@@ -82,13 +81,13 @@ mod tests {
         )
         .unwrap();
 
-        let mut writer = Writer::new(&avro_schema, Vec::new());
+        let mut writer = Writer::new(&avro_schema, Vec::new()).unwrap();
 
         for (id, name) in records {
             let mut record: Record<'_> = Record::new(writer.schema()).unwrap();
             record.put("id", id);
             record.put("name", name);
-            writer.append(record).unwrap();
+            writer.append_value(record).unwrap();
         }
 
         writer.into_inner().unwrap()
@@ -154,6 +153,6 @@ mod tests {
 
         let result = decoder.to_record_batch();
 
-        assert!(matches!(result, Err(DenormalizedError::DataFusion(_))));
+        assert!(matches!(result, Err(DenormalizedError::Arrow(_))));
     }
 }

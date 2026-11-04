@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use datafusion::common::Result;
 use datafusion::logical_expr::Accumulator;
 use datafusion::physical_expr::aggregate::AggregateFunctionExpr;
@@ -5,7 +7,7 @@ use datafusion::physical_expr::aggregate::AggregateFunctionExpr;
 pub(crate) type AccumulatorItem = Box<dyn Accumulator>;
 
 pub(crate) fn create_accumulators(
-    aggr_expr: &[AggregateFunctionExpr],
+    aggr_expr: &[Arc<AggregateFunctionExpr>],
 ) -> Result<Vec<AccumulatorItem>> {
     aggr_expr
         .iter()

@@ -9,7 +9,7 @@ use arrow::{
 use arrow_array::{Array, BooleanArray, RecordBatch};
 use arrow_schema::{DataType, Field, Schema, SchemaBuilder, SchemaRef, TimeUnit};
 use datafusion::{
-    common::{downcast_value, DataFusionError, Result},
+    common::{downcast_value, Result},
     logical_expr::GroupsAccumulator,
     physical_expr::GroupsAccumulatorAdapter,
     physical_plan::PhysicalExpr,

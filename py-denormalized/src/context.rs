@@ -13,7 +13,7 @@ use crate::datastream::PyDataStream;
 use crate::errors::py_denormalized_err;
 use crate::utils::{get_tokio_runtime, wait_for_future};
 
-#[pyclass(module = "denormalized", subclass)]
+#[pyclass(module = "denormalized", subclass, from_py_object)]
 #[derive(Clone)]
 pub struct PyContext {
     context: Arc<Context>,

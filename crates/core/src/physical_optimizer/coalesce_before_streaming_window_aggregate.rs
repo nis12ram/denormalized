@@ -10,6 +10,7 @@ use datafusion::error::Result;
 
 use crate::physical_plan::continuous::streaming_window::StreamingWindowExec;
 
+#[derive(Debug)]
 pub struct EnsureHashPartititionOnGroupByForStreamingAggregates {}
 
 impl Default for EnsureHashPartititionOnGroupByForStreamingAggregates {
@@ -36,26 +37,19 @@ impl PhysicalOptimizerRule for EnsureHashPartititionOnGroupByForStreamingAggrega
         config: &datafusion::common::config::ConfigOptions,
     ) -> Result<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
         plan.transform(|original| {
-            if let Some(streaming_aggr_exec) =
-                original.as_any().downcast_ref::<StreamingWindowExec>()
-            {
+            if let Some(streaming_aggr_exec) = original.downcast_ref::<StreamingWindowExec>() {
                 let input = streaming_aggr_exec.input();
-                let partitions = match input.output_partitioning() {
-                    datafusion::physical_expr::Partitioning::RoundRobinBatch(size) => size,
-                    datafusion::physical_expr::Partitioning::Hash(_, size) => size,
-                    datafusion::physical_expr::Partitioning::UnknownPartitioning(size) => size,
-                };
-                if *partitions == 1 {
+                let partitions = input.output_partitioning().partition_count();
+                if partitions == 1 {
                     return Ok(Transformed::no(original));
                 }
                 let group_by = streaming_aggr_exec.group_by.expr();
                 // Make sure we dont have contiguous repartitions. TODO: Make this a separate rule.
-                let input_exec =
-                    if let Some(in_exec) = input.as_any().downcast_ref::<RepartitionExec>() {
-                        in_exec.input()
-                    } else {
-                        input
-                    };
+                let input_exec = if let Some(in_exec) = input.downcast_ref::<RepartitionExec>() {
+                    in_exec.input()
+                } else {
+                    input
+                };
 
                 let coalesce_exec = if streaming_aggr_exec.group_by.is_empty() {
                     return Ok(Transformed::no(original));

@@ -18,12 +18,12 @@ pyo3 = { workspace = true, features = [
 chrono = { workspace = true }
 denormalized = { workspace = true, features = ["python"] }
 datafusion = { workspace = true, features = [
-  "pyarrow",
   "avro",
   "unicode_expressions",
 ] }
-# datafusion-python = { path = "../../datafusion-python/" }
-datafusion-python = { git = "https://github.com/probably-nothing-labs/datafusion-python", branch = "denormalized-tweaks" }
+# Vendored from datafusion-python 55.0.0. Only the module-init functions that
+# denormalized registers into its own extension module were made public.
+datafusion-python = { path = "vendor/datafusion-python" }
 tokio = { workspace = true, features = [
   "macros",
   "rt",

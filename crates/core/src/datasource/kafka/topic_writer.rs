@@ -1,20 +1,20 @@
 use async_trait::async_trait;
 use futures::StreamExt;
 use std::fmt::{self, Debug};
+use std::sync::Arc;
 use std::time::Duration;
-use std::{any::Any, sync::Arc};
 
 use arrow_schema::SchemaRef;
 
 use datafusion::catalog::Session;
 use datafusion::common::{not_impl_err, Result};
+use datafusion::datasource::sink::{DataSink, DataSinkExec};
 use datafusion::datasource::TableProvider;
 use datafusion::execution::TaskContext;
+use datafusion::logical_expr::dml::InsertOp;
 use datafusion::logical_expr::{Expr, TableType};
 use datafusion::physical_plan::{
-    insert::{DataSink, DataSinkExec},
-    metrics::MetricsSet,
-    DisplayAs, DisplayFormatType, ExecutionPlan, SendableRecordBatchStream,
+    metrics::MetricsSet, DisplayAs, DisplayFormatType, ExecutionPlan, SendableRecordBatchStream,
 };
 
 use rdkafka::producer::FutureProducer;
@@ -24,6 +24,7 @@ use super::KafkaWriteConfig;
 use crate::utils::row_encoder::{JsonRowEncoder, RowEncoder};
 
 // Used to createa kafka source
+#[derive(Debug)]
 pub struct TopicWriter(pub Arc<KafkaWriteConfig>);
 
 impl TopicWriter {
@@ -35,10 +36,6 @@ impl TopicWriter {
 
 #[async_trait]
 impl TableProvider for TopicWriter {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.0.schema.clone()
     }
@@ -61,18 +58,13 @@ impl TableProvider for TopicWriter {
         &self,
         _state: &dyn Session,
         input: Arc<dyn ExecutionPlan>,
-        overwrite: bool,
+        insert_op: InsertOp,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        if overwrite {
-            return not_impl_err!("Overwrite not implemented for TopicWriter");
+        if insert_op != InsertOp::Append {
+            return not_impl_err!("Only INSERT INTO (append) is supported for TopicWriter");
         }
         let sink = Arc::new(KafkaSink::new(self.0.clone()));
-        Ok(Arc::new(DataSinkExec::new(
-            input,
-            sink,
-            self.schema(),
-            None,
-        )))
+        Ok(Arc::new(DataSinkExec::new(input, sink, None)))
     }
 }
 
@@ -91,8 +83,8 @@ impl KafkaSink {
 
 #[async_trait]
 impl DataSink for KafkaSink {
-    fn as_any(&self) -> &dyn Any {
-        self
+    fn schema(&self) -> &SchemaRef {
+        &self.config.schema
     }
 
     fn metrics(&self) -> Option<MetricsSet> {
@@ -138,7 +130,9 @@ impl Debug for KafkaSink {
 impl DisplayAs for KafkaSink {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match t {
-            DisplayFormatType::Default | DisplayFormatType::Verbose => {
+            DisplayFormatType::Default
+            | DisplayFormatType::Verbose
+            | DisplayFormatType::TreeRender => {
                 let partition_count = self.config.partition_count;
                 write!(f, "KafkaTable (partitions={partition_count})")
             }

@@ -37,7 +37,7 @@ async fn main() -> Result<()> {
         .sort(vec![col("ts").sort(true, true)])?;
 
     // create and register a new memtable with the same schema as the aggregated results
-    let csv_schema = datafusion::common::arrow::datatypes::Schema::from(df.schema());
+    let csv_schema = df.schema().as_arrow().clone();
 
     let mem_table = MemTable::try_new(std::sync::Arc::new(csv_schema.clone()), vec![vec![]])?;
     ctx.register_table("out_table", std::sync::Arc::new(mem_table))?;
