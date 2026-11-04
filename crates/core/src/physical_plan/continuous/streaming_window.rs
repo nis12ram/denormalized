@@ -6,7 +6,6 @@ use arrow_array::{Array, PrimitiveArray, RecordBatch, StructArray, TimestampMill
 use arrow_ord::cmp;
 use arrow_schema::{Field, Schema, SchemaRef};
 use std::{
-    any::Any,
     borrow::Cow,
     collections::BTreeMap,
     pin::Pin,
@@ -18,19 +17,15 @@ use std::{
 use datafusion::execution::{RecordBatchStream, SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::aggregate::AggregateFunctionExpr;
 use datafusion::physical_expr::{
-    equivalence::{collapse_lex_req, ProjectionMapping},
-    expressions::UnKnownColumn,
-    Partitioning, PhysicalExpr, PhysicalSortRequirement,
+    equivalence::ProjectionMapping, expressions::UnKnownColumn, Partitioning, PhysicalExpr,
 };
 use datafusion::physical_plan::{
-    aggregates::{
-        aggregate_expressions, finalize_aggregation, get_finer_aggregate_exprs_requirement,
-        AggregateMode, PhysicalGroupBy,
-    },
+    aggregates::{aggregate_expressions, finalize_aggregation, AggregateMode, PhysicalGroupBy},
+    execution_plan::EmissionType,
     metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet},
     windows::get_ordered_partition_by_indices,
-    DisplayAs, DisplayFormatType, ExecutionMode, ExecutionPlan, ExecutionPlanProperties,
-    InputOrderMode, PlanProperties,
+    DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, InputOrderMode,
+    PlanProperties,
 };
 
 use datafusion::{
@@ -71,7 +66,9 @@ pub struct PartialWindowAggFrame {
 impl DisplayAs for PartialWindowAggFrame {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match t {
-            DisplayFormatType::Default | DisplayFormatType::Verbose => {
+            DisplayFormatType::Default
+            | DisplayFormatType::Verbose
+            | DisplayFormatType::TreeRender => {
                 write!(f, "WindowAggExec: ")?;
                 write!(
                     f,
@@ -200,7 +197,7 @@ pub enum PhysicalStreamingWindowType {
 #[derive(Debug)]
 pub struct StreamingWindowExec {
     pub(crate) input: Arc<dyn ExecutionPlan>,
-    pub aggregate_expressions: Vec<AggregateFunctionExpr>,
+    pub aggregate_expressions: Vec<Arc<AggregateFunctionExpr>>,
     pub filter_expressions: Vec<Option<Arc<dyn PhysicalExpr>>>,
     /// Schema after the window is run
     pub group_by: PhysicalGroupBy,
@@ -209,7 +206,8 @@ pub struct StreamingWindowExec {
 
     pub watermark: Arc<Mutex<Option<SystemTime>>>,
     pub(crate) metrics: ExecutionPlanMetricsSet,
-    cache: PlanProperties,
+    cache: Arc<PlanProperties>,
+    node_id: Option<usize>,
     pub mode: AggregateMode,
     pub window_type: PhysicalStreamingWindowType,
     pub upstream_partitioning: Option<usize>,
@@ -221,7 +219,7 @@ impl StreamingWindowExec {
     pub fn try_new(
         mode: AggregateMode,
         group_by: PhysicalGroupBy,
-        aggr_expr: Vec<AggregateFunctionExpr>,
+        aggr_expr: Vec<Arc<AggregateFunctionExpr>>,
         filter_expr: Vec<Option<Arc<dyn PhysicalExpr>>>,
         input: Arc<dyn ExecutionPlan>,
         input_schema: SchemaRef,
@@ -253,7 +251,7 @@ impl StreamingWindowExec {
     pub fn try_new_with_schema(
         mode: AggregateMode,
         group_by: PhysicalGroupBy,
-        mut aggr_expr: Vec<AggregateFunctionExpr>,
+        aggr_expr: Vec<Arc<AggregateFunctionExpr>>,
         filter_expr: Vec<Option<Arc<dyn PhysicalExpr>>>,
         input: Arc<dyn ExecutionPlan>,
         input_schema: SchemaRef,
@@ -265,29 +263,12 @@ impl StreamingWindowExec {
             return internal_err!("Inconsistent aggregate expr: {:?} and filter expr: {:?} for AggregateExec, their size should match", aggr_expr, filter_expr);
         }
 
-        let input_eq_properties = input.equivalence_properties();
         // Get GROUP BY expressions:
         let groupby_exprs = group_by.input_exprs();
         // If existing ordering satisfies a prefix of the GROUP BY expressions,
         // prefix requirements with this section. In this case, aggregation will
         // work more efficiently.
-        let indices = get_ordered_partition_by_indices(&groupby_exprs, &input);
-        let mut _new_requirement = indices
-            .iter()
-            .map(|&idx| PhysicalSortRequirement {
-                expr: groupby_exprs[idx].clone(),
-                options: None,
-            })
-            .collect::<Vec<_>>();
-
-        let req = get_finer_aggregate_exprs_requirement(
-            &mut aggr_expr,
-            &group_by,
-            input_eq_properties,
-            &mode,
-        )?;
-        _new_requirement.extend(req);
-        _new_requirement = collapse_lex_req(_new_requirement);
+        let indices = get_ordered_partition_by_indices(&groupby_exprs, &input)?;
 
         let input_order_mode = if indices.len() == groupby_exprs.len() && !indices.is_empty() {
             InputOrderMode::Sorted
@@ -298,7 +279,8 @@ impl StreamingWindowExec {
         };
 
         // construct a map from the input expression to the output expression of the Aggregation group by
-        let projection_mapping = ProjectionMapping::try_new(group_by.expr(), &input.schema())?;
+        let projection_mapping =
+            ProjectionMapping::try_new(group_by.expr().iter().cloned(), &input.schema())?;
 
         let cache = StreamingWindowExec::compute_properties(
             &input,
@@ -318,6 +300,7 @@ impl StreamingWindowExec {
             watermark: Arc::new(Mutex::new(None)),
             metrics: ExecutionPlanMetricsSet::new(),
             cache,
+            node_id: None,
             mode,
             window_type,
             upstream_partitioning,
@@ -341,7 +324,7 @@ impl StreamingWindowExec {
         projection_mapping: &ProjectionMapping,
         mode: &AggregateMode,
         _input_order_mode: &InputOrderMode,
-    ) -> PlanProperties {
+    ) -> Arc<PlanProperties> {
         // Construct equivalence properties:
         let eq_properties = input
             .equivalence_properties()
@@ -349,7 +332,10 @@ impl StreamingWindowExec {
 
         // Get output partitioning:
         let mut output_partitioning = input.output_partitioning().clone();
-        if mode.is_first_stage() {
+        if matches!(
+            mode,
+            AggregateMode::Partial | AggregateMode::Single | AggregateMode::SinglePartitioned
+        ) {
             // First stage aggregation will not change the output partitioning,
             // but needs to respect aliases (e.g. mapping in the GROUP BY
             // expression).
@@ -367,10 +353,15 @@ impl StreamingWindowExec {
             }
         }
 
-        PlanProperties::new(eq_properties, output_partitioning, ExecutionMode::Unbounded)
+        Arc::new(PlanProperties::new(
+            eq_properties,
+            output_partitioning,
+            EmissionType::Incremental,
+            input.boundedness(),
+        ))
     }
     /// Aggregate expressions
-    pub fn aggr_expr(&self) -> &[AggregateFunctionExpr] {
+    pub fn aggr_expr(&self) -> &[Arc<AggregateFunctionExpr>] {
         &self.aggregate_expressions
     }
 
@@ -385,12 +376,7 @@ impl ExecutionPlan for StreamingWindowExec {
         "StreamingWindowExec"
     }
 
-    /// Return a reference to Any that can be used for downcasting
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.cache
     }
 
@@ -423,11 +409,6 @@ impl ExecutionPlan for StreamingWindowExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
-        let node_id = self
-            .properties()
-            .node_id()
-            .expect("expected node id to be set.");
-
         let config_options = context
             .session_config()
             .options()
@@ -437,6 +418,9 @@ impl ExecutionPlan for StreamingWindowExec {
         let checkpoint = config_options.map_or(false, |c| c.checkpoint);
 
         let channel_tag = if checkpoint {
+            let node_id = self
+                .node_id
+                .expect("expected node id to be set when checkpointing");
             let tag = format!("{}_{}", node_id, partition);
             create_channel(tag.as_str(), 10);
             let orchestrator_sender = get_sender("orchestrator");
@@ -492,43 +476,50 @@ impl ExecutionPlan for StreamingWindowExec {
         Some(self.metrics.clone_inner())
     }
 
-    fn statistics(&self) -> Result<Statistics> {
+    #[allow(deprecated)]
+    fn partition_statistics(&self, _partition: Option<usize>) -> Result<Arc<Statistics>> {
         let column_statistics = Statistics::unknown_column(&self.schema());
         match self.mode {
             AggregateMode::Final | AggregateMode::FinalPartitioned if self.group_by.is_empty() => {
-                Ok(Statistics {
+                Ok(Arc::new(Statistics {
                     num_rows: Precision::Exact(1),
                     column_statistics,
                     total_byte_size: Precision::Absent,
-                })
+                }))
             }
             _ => {
                 // When the input row count is 0 or 1, we can adopt that statistic keeping its reliability.
                 // When it is larger than 1, we degrade the precision since it may decrease after aggregation.
-                let num_rows = if let Some(value) = self.input().statistics()?.num_rows.get_value()
-                {
+                let input_stats = self.input().partition_statistics(None)?;
+                let num_rows = if let Some(value) = input_stats.num_rows.get_value() {
                     if *value > 1 {
-                        self.input().statistics()?.num_rows.to_inexact()
+                        input_stats.num_rows.to_inexact()
                     } else if *value == 0 {
                         // Aggregation on an empty table creates a null row.
-                        self.input()
-                            .statistics()?
-                            .num_rows
-                            .add(&Precision::Exact(1))
+                        input_stats.num_rows.add(&Precision::Exact(1))
                     } else {
                         // num_rows = 1 case
-                        self.input().statistics()?.num_rows
+                        input_stats.num_rows
                     }
                 } else {
                     Precision::Absent
                 };
-                Ok(Statistics {
+                Ok(Arc::new(Statistics {
                     num_rows,
                     column_statistics,
                     total_byte_size: Precision::Absent,
-                })
+                }))
             }
         }
+    }
+
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(
+            &Arc<dyn PhysicalExpr>,
+        ) -> Result<datafusion::common::tree_node::TreeNodeRecursion>,
+    ) -> Result<datafusion::common::tree_node::TreeNodeRecursion> {
+        Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
     }
 
     fn schema(&self) -> SchemaRef {
@@ -542,10 +533,11 @@ impl ExecutionPlan for StreamingWindowExec {
     ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
         Ok(None)
     }
+}
 
-    fn with_node_id(self: Arc<Self>, _node_id: usize) -> Result<Option<Arc<dyn ExecutionPlan>>> {
-        let cache = self.properties().clone().with_node_id(_node_id);
-        let new_exec = StreamingWindowExec {
+impl StreamingWindowExec {
+    pub fn with_node_id(&self, node_id: usize) -> Arc<dyn ExecutionPlan> {
+        Arc::new(StreamingWindowExec {
             input: self.input.clone(),
             aggregate_expressions: self.aggregate_expressions.clone(),
             filter_expressions: self.filter_expressions.clone(),
@@ -554,19 +546,21 @@ impl ExecutionPlan for StreamingWindowExec {
             input_schema: self.input_schema.clone(),
             watermark: Arc::new(Mutex::new(None)),
             metrics: ExecutionPlanMetricsSet::new(),
-            cache,
+            cache: self.cache.clone(),
+            node_id: Some(node_id),
             mode: self.mode,
             window_type: self.window_type,
             upstream_partitioning: self.upstream_partitioning,
-        };
-        Ok(Some(Arc::new(new_exec)))
+        })
     }
 }
 
 impl DisplayAs for StreamingWindowExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match t {
-            DisplayFormatType::Default | DisplayFormatType::Verbose => {
+            DisplayFormatType::Default
+            | DisplayFormatType::Verbose
+            | DisplayFormatType::TreeRender => {
                 write!(f, "StreamingWindowExec: mode={:?}", self.mode)?;
                 let g: Vec<String> = if self.group_by.is_single() {
                     self.group_by
@@ -641,7 +635,7 @@ pub struct WindowAggStream {
     pub schema: SchemaRef,
     input: SendableRecordBatchStream,
     baseline_metrics: BaselineMetrics,
-    exec_aggregate_expressions: Vec<AggregateFunctionExpr>,
+    exec_aggregate_expressions: Vec<Arc<AggregateFunctionExpr>>,
     aggregate_expressions: Vec<Vec<Arc<dyn PhysicalExpr>>>,
     filter_expressions: Vec<Option<Arc<dyn PhysicalExpr>>>,
     latest_watermark: Arc<Mutex<Option<SystemTime>>>,
@@ -676,7 +670,9 @@ impl WindowAggStream {
             AggregateMode::Partial | AggregateMode::Single | AggregateMode::SinglePartitioned => {
                 agg_filter_expr
             }
-            AggregateMode::Final | AggregateMode::FinalPartitioned => {
+            AggregateMode::Final
+            | AggregateMode::FinalPartitioned
+            | AggregateMode::PartialReduce => {
                 vec![None; exec_operator.aggregate_expressions.len()]
             }
         };
@@ -726,7 +722,7 @@ impl WindowAggStream {
             }
         }
         concat_batches(&self.output_schema_with_window(), &results)
-            .map_err(|err| DataFusionError::ArrowError(err, None))
+            .map_err(|err| DataFusionError::ArrowError(Box::new(err), None))
     }
 
     fn process_watermark(&mut self, watermark: RecordBatchWatermark) {
@@ -842,7 +838,7 @@ impl FullWindowAggFrame {
     pub fn new(
         start_time: SystemTime,
         end_time: SystemTime,
-        exec_aggregate_expressions: &[AggregateFunctionExpr],
+        exec_aggregate_expressions: &[Arc<AggregateFunctionExpr>],
         aggregate_expressions: Vec<Vec<Arc<dyn PhysicalExpr>>>,
         filter_expressions: Vec<Option<Arc<dyn PhysicalExpr>>>,
 
@@ -883,7 +879,7 @@ struct FullWindowAggStream {
     pub schema: SchemaRef,
     input: SendableRecordBatchStream,
     baseline_metrics: BaselineMetrics,
-    exec_aggregate_expressions: Vec<AggregateFunctionExpr>,
+    exec_aggregate_expressions: Vec<Arc<AggregateFunctionExpr>>,
     aggregate_expressions: Vec<Vec<Arc<dyn PhysicalExpr>>>,
     filter_expressions: Vec<Option<Arc<dyn PhysicalExpr>>>,
     cached_frames: BTreeMap<SystemTime, FullWindowAggFrame>,
@@ -949,7 +945,7 @@ impl FullWindowAggStream {
             &Arc::new(add_window_columns_to_schema(self.schema.clone())),
             &results,
         )
-        .map_err(|err| DataFusionError::ArrowError(err, None))
+        .map_err(|err| DataFusionError::ArrowError(Box::new(err), None))
     }
 
     #[inline]
@@ -1096,7 +1092,7 @@ fn snap_to_window_start(timestamp: SystemTime, window_length: Duration) -> Syste
 fn create_schema(
     input_schema: &Schema,
     group_expr: &[(Arc<dyn PhysicalExpr>, String)],
-    aggr_expr: &[AggregateFunctionExpr],
+    aggr_expr: &[Arc<AggregateFunctionExpr>],
     contains_null_expr: bool,
     mode: AggregateMode,
 ) -> Result<Schema> {
@@ -1113,10 +1109,10 @@ fn create_schema(
     }
 
     match mode {
-        AggregateMode::Partial => {
+        AggregateMode::Partial | AggregateMode::PartialReduce => {
             // in partial mode, the fields of the accumulator's state
             for expr in aggr_expr {
-                fields.extend(expr.state_fields()?.iter().cloned())
+                fields.extend(expr.state_fields()?.iter().map(|f| f.as_ref().clone()))
             }
         }
         AggregateMode::Final
@@ -1125,7 +1121,7 @@ fn create_schema(
         | AggregateMode::SinglePartitioned => {
             // in final mode, the field with the final result of the accumulator
             for expr in aggr_expr {
-                fields.push(expr.field())
+                fields.push(expr.field().as_ref().clone())
             }
         }
     }
@@ -1173,7 +1169,9 @@ pub fn aggregate_batch(
                 AggregateMode::Partial
                 | AggregateMode::Single
                 | AggregateMode::SinglePartitioned => accum.update_batch(values),
-                AggregateMode::Final | AggregateMode::FinalPartitioned => accum.merge_batch(values),
+                AggregateMode::Final
+                | AggregateMode::FinalPartitioned
+                | AggregateMode::PartialReduce => accum.merge_batch(values),
             };
             let size_post = accum.size();
             allocated += size_post.saturating_sub(size_pre);

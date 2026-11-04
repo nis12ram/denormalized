@@ -1,4 +1,5 @@
 use pyo3::prelude::*;
+use pyo3::types::PyAny;
 
 use futures::StreamExt;
 use std::sync::Arc;
@@ -19,7 +20,12 @@ use denormalized::datastream::DataStream;
 use crate::errors::{py_denormalized_err, DenormalizedError, Result};
 use crate::utils::{get_tokio_runtime, python_print, wait_for_future};
 
-#[pyclass(name = "PyDataStream", module = "denormalized", subclass)]
+#[pyclass(
+    name = "PyDataStream",
+    module = "denormalized",
+    subclass,
+    from_py_object
+)]
 #[derive(Clone)]
 pub struct PyDataStream {
     ds: Arc<DataStream>,
@@ -67,7 +73,7 @@ impl PyDataStream {
     }
 
     fn schema(&self) -> PyArrowType<Schema> {
-        PyArrowType(self.ds.schema().into())
+        PyArrowType(self.ds.schema().as_arrow().clone())
     }
 
     pub fn select(&self, expr_list: Vec<PyExpr>) -> PyResult<Self> {
@@ -226,7 +232,7 @@ impl PyDataStream {
     }
 
     /// Execute the dataframe and pass the resulting recordbatch to a python function
-    pub fn sink_python(&self, func: PyObject, py: Python) -> PyResult<()> {
+    pub fn sink_python(&self, func: Py<PyAny>, py: Python) -> PyResult<()> {
         let ds = self.ds.as_ref().clone();
         let rt = &get_tokio_runtime(py).0;
 
@@ -241,7 +247,7 @@ impl PyDataStream {
                     message = stream.next() => {
                         match message.transpose() {
                             Ok(Some(batch)) => {
-                                Python::with_gil(|py| -> PyResult<()> {
+                                Python::attach(|py| -> PyResult<()> {
                                     let mut batch = batch.clone();
                                     if let Ok(col_idx) = batch.schema_ref().index_of(INTERNAL_METADATA_COLUMN) {
                                         batch.remove_column(col_idx);

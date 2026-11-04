@@ -173,6 +173,7 @@ fn infer_arrow_schema_from_avro_value(value: &Value, name: String) -> Field {
         Value::LocalTimestampMicros(_) => todo!(),
         Value::Duration(_) => todo!(),
         Value::Uuid(_) => todo!(),
+        _ => todo!(),
     }
 }
 

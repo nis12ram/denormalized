@@ -29,7 +29,7 @@ use rdkafka::{ClientConfig, Message, Offset, TopicPartitionList};
 
 use super::KafkaReadConfig;
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct KafkaStreamRead {
     pub config: Arc<KafkaReadConfig>,
     pub assigned_partitions: Vec<i32>,
@@ -93,7 +93,6 @@ impl PartitionStream for KafkaStreamRead {
 
         let should_checkpoint = config_options.map_or(false, |c| c.checkpoint);
 
-        let node_id = self.exec_node_id.unwrap();
         let partition_tag = self
             .assigned_partitions
             .iter()
@@ -101,7 +100,14 @@ impl PartitionStream for KafkaStreamRead {
             .collect::<Vec<String>>()
             .join("_");
 
-        let channel_tag = format!("{}_{}", node_id, partition_tag);
+        let channel_tag = if should_checkpoint {
+            let node_id = self
+                .exec_node_id
+                .expect("expected node id to be set when checkpointing");
+            format!("{}_{}", node_id, partition_tag)
+        } else {
+            String::new()
+        };
         let mut serialized_state: Option<Vec<u8>> = None;
         let mut state_backend = None;
 

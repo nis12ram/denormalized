@@ -47,7 +47,7 @@ impl SerializableAccumulator for ArrayAggAccumulator {
             ));
         };
 
-        let mut acc = ArrayAggAccumulator::try_new(&datatype)?;
+        let mut acc = ArrayAggAccumulator::try_new(&datatype, false)?;
 
         // Convert ScalarValue to ArrayRef for merge_batch
         let arrays: Vec<ArrayRef> = state
@@ -84,11 +84,11 @@ mod tests {
 
     #[test]
     fn test_serialize_deserialize_int32() -> Result<()> {
-        let mut acc = ArrayAggAccumulator::try_new(&DataType::Int32)?;
+        let mut acc = ArrayAggAccumulator::try_new(&DataType::Int32, false)?;
         acc.update_batch(&[create_int32_array(vec![Some(1)])])?;
 
         let serialized = SerializableAccumulator::serialize(&mut acc)?;
-        let acc2 = ArrayAggAccumulator::try_new(&DataType::Int32)?;
+        let acc2 = ArrayAggAccumulator::try_new(&DataType::Int32, false)?;
 
         let mut deserialized = ArrayAggAccumulator::deserialize(acc2, serialized)?;
 
@@ -98,11 +98,11 @@ mod tests {
 
     #[test]
     fn test_serialize_deserialize_string() -> Result<()> {
-        let mut acc = ArrayAggAccumulator::try_new(&DataType::Utf8)?;
+        let mut acc = ArrayAggAccumulator::try_new(&DataType::Utf8, false)?;
         acc.update_batch(&[create_string_array(vec![Some("hello")])])?;
 
         let serialized = SerializableAccumulator::serialize(&mut acc)?;
-        let acc2 = ArrayAggAccumulator::try_new(&DataType::Utf8)?;
+        let acc2 = ArrayAggAccumulator::try_new(&DataType::Utf8, false)?;
 
         let mut deserialized = ArrayAggAccumulator::deserialize(acc2, serialized)?;
 

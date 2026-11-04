@@ -1,0 +1,2149 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::ptr::NonNull;
+use std::str::FromStr;
+use std::sync::Arc;
+
+use arrow::array::RecordBatchReader;
+use arrow::ffi_stream::ArrowArrayStreamReader;
+use arrow::pyarrow::FromPyArrow;
+use datafusion::arrow::datatypes::{DataType, Schema, SchemaRef};
+use datafusion::arrow::pyarrow::PyArrowType;
+use datafusion::arrow::record_batch::RecordBatch;
+use datafusion::catalog::{CatalogProvider, CatalogProviderList, TableProviderFactory};
+use datafusion::common::{DFSchema, ScalarValue, TableReference, exec_err};
+use datafusion::datasource::file_format::file_compression_type::FileCompressionType;
+use datafusion::datasource::file_format::parquet::ParquetFormat;
+use datafusion::datasource::listing::{
+    ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
+};
+use datafusion::datasource::{MemTable, TableProvider};
+use datafusion::execution::context::{
+    DataFilePaths, QueryPlanner, SQLOptions, SessionConfig, SessionContext, TaskContext,
+};
+use datafusion::execution::disk_manager::DiskManagerMode;
+use datafusion::execution::memory_pool::{FairSpillPool, GreedyMemoryPool, UnboundedMemoryPool};
+use datafusion::execution::options::{ArrowReadOptions, ReadOptions};
+use datafusion::execution::runtime_env::RuntimeEnvBuilder;
+use datafusion::execution::session_state::SessionStateBuilder;
+use datafusion::execution::{FunctionRegistry, TaskContextProvider};
+use datafusion::physical_plan::ExecutionPlanProperties;
+use datafusion::prelude::{
+    AvroReadOptions, CsvReadOptions, DataFrame, JsonReadOptions, ParquetReadOptions,
+};
+use datafusion_ffi::catalog_provider::FFI_CatalogProvider;
+use datafusion_ffi::catalog_provider_list::FFI_CatalogProviderList;
+use datafusion_ffi::config::extension_options::FFI_ExtensionOptions;
+use datafusion_ffi::execution::FFI_TaskContextProvider;
+use datafusion_ffi::proto::logical_extension_codec::FFI_LogicalExtensionCodec;
+use datafusion_ffi::proto::physical_extension_codec::FFI_PhysicalExtensionCodec;
+use datafusion_ffi::query_planner::{FFI_QueryPlanner, ForeignQueryPlanner};
+use datafusion_ffi::table_provider_factory::FFI_TableProviderFactory;
+use datafusion_proto::logical_plan::LogicalExtensionCodec;
+use datafusion_proto::physical_plan::PhysicalExtensionCodec;
+use datafusion_python_util::{
+    CapsuleGetterArg, call_capsule_getter, create_logical_extension_capsule,
+    create_physical_extension_capsule, create_query_planner_capsule,
+    ffi_logical_codec_from_pycapsule, ffi_physical_codec_from_pycapsule,
+    ffi_query_planner_from_pycapsule, get_global_ctx, get_tokio_runtime,
+    physical_optimizer_rule_from_pycapsule, spawn_future, validate_pycapsule, wait_for_future,
+};
+use object_store::ObjectStore;
+use pyo3::IntoPyObjectExt;
+use pyo3::exceptions::{PyKeyError, PyRuntimeError, PyTypeError, PyValueError};
+use pyo3::prelude::*;
+use pyo3::types::{PyCapsule, PyDict, PyList, PyTuple};
+use url::Url;
+use uuid::Uuid;
+
+use crate::catalog::{
+    PyCatalog, PyCatalogList, RustWrappedPyCatalogProvider, RustWrappedPyCatalogProviderList,
+};
+use crate::codec::{
+    ANONYMOUS_CODEC_ID_PREFIX, PythonLogicalCodec, PythonPhysicalCodec, SESSION_CODEC_ID_PREFIX,
+};
+use crate::common::data_type::PyScalarValue;
+use crate::common::df_schema::PyDFSchema;
+use crate::dataframe::PyDataFrame;
+use crate::dataset::Dataset;
+use crate::errors::{
+    PyDataFusionError, PyDataFusionResult, from_datafusion_error, py_datafusion_err,
+};
+use crate::expr::PyExpr;
+use crate::expr::sort_expr::PySortExpr;
+use crate::options::PyCsvReadOptions;
+use crate::physical_plan::PyExecutionPlan;
+use crate::record_batch::PyRecordBatchStream;
+use crate::sql::logical::PyLogicalPlan;
+use crate::sql::util::replace_placeholders_with_strings;
+use crate::store::StorageContexts;
+use crate::table::{PyTable, RustWrappedPyTableProviderFactory};
+use crate::udaf::PyAggregateUDF;
+use crate::udf::PyScalarUDF;
+use crate::udtf::PyTableFunction;
+use crate::udwf::PyWindowUDF;
+
+/// Configuration options for a SessionContext
+#[pyclass(
+    from_py_object,
+    frozen,
+    name = "SessionConfig",
+    module = "datafusion",
+    subclass
+)]
+#[derive(Clone, Default)]
+pub struct PySessionConfig {
+    pub config: SessionConfig,
+}
+
+impl From<SessionConfig> for PySessionConfig {
+    fn from(config: SessionConfig) -> Self {
+        Self { config }
+    }
+}
+
+#[pymethods]
+impl PySessionConfig {
+    /// Build a config, optionally applying options by key.
+    ///
+    /// Each entry goes through the same fallible path as [`Self::set`] rather
+    /// than `SessionConfig::set`, which forwards to `set_str` and unwraps: an
+    /// unknown namespace would abort as a `PanicException` before any of the
+    /// remaining entries were applied. Replaying a settings dictionary is the
+    /// reason this constructor takes one, and
+    /// `information_schema.df_settings` lists keys it cannot accept.
+    #[pyo3(signature = (config_options=None))]
+    #[new]
+    fn new(config_options: Option<HashMap<String, String>>) -> PyResult<Self> {
+        let mut config = SessionConfig::new();
+        if let Some(hash_map) = config_options {
+            for (k, v) in &hash_map {
+                config
+                    .options_mut()
+                    .set(k, v)
+                    .map_err(from_datafusion_error)?;
+            }
+        }
+
+        Ok(Self { config })
+    }
+
+    fn with_create_default_catalog_and_schema(&self, enabled: bool) -> Self {
+        Self::from(
+            self.config
+                .clone()
+                .with_create_default_catalog_and_schema(enabled),
+        )
+    }
+
+    fn with_default_catalog_and_schema(&self, catalog: &str, schema: &str) -> Self {
+        Self::from(
+            self.config
+                .clone()
+                .with_default_catalog_and_schema(catalog, schema),
+        )
+    }
+
+    fn with_information_schema(&self, enabled: bool) -> Self {
+        Self::from(self.config.clone().with_information_schema(enabled))
+    }
+
+    fn with_batch_size(&self, batch_size: usize) -> Self {
+        Self::from(self.config.clone().with_batch_size(batch_size))
+    }
+
+    fn with_target_partitions(&self, target_partitions: usize) -> Self {
+        Self::from(
+            self.config
+                .clone()
+                .with_target_partitions(target_partitions),
+        )
+    }
+
+    fn with_repartition_aggregations(&self, enabled: bool) -> Self {
+        Self::from(self.config.clone().with_repartition_aggregations(enabled))
+    }
+
+    fn with_repartition_joins(&self, enabled: bool) -> Self {
+        Self::from(self.config.clone().with_repartition_joins(enabled))
+    }
+
+    fn with_repartition_windows(&self, enabled: bool) -> Self {
+        Self::from(self.config.clone().with_repartition_windows(enabled))
+    }
+
+    fn with_repartition_sorts(&self, enabled: bool) -> Self {
+        Self::from(self.config.clone().with_repartition_sorts(enabled))
+    }
+
+    fn with_repartition_file_scans(&self, enabled: bool) -> Self {
+        Self::from(self.config.clone().with_repartition_file_scans(enabled))
+    }
+
+    fn with_repartition_file_min_size(&self, size: usize) -> Self {
+        Self::from(self.config.clone().with_repartition_file_min_size(size))
+    }
+
+    fn with_parquet_pruning(&self, enabled: bool) -> Self {
+        Self::from(self.config.clone().with_parquet_pruning(enabled))
+    }
+
+    /// Set a config option by key.
+    ///
+    /// Not routed through `SessionConfig::set_str`, which unwraps the result:
+    /// an unknown namespace -- `datafusion.runtime.*`, or a config extension
+    /// that has not been installed yet -- would abort as a `PanicException`
+    /// rather than raise. `information_schema.df_settings` lists keys in both
+    /// of those categories, so replaying it is otherwise unsafe.
+    ///
+    /// Mapped with `from_datafusion_error` rather than propagated as a
+    /// `PyDataFusionError`, whose blanket conversion yields a bare `Exception`.
+    /// A rejected key or value is an argument error, so it raises `ValueError`
+    /// the way an out-of-range partition index does in `execute`.
+    fn set(&self, key: &str, value: &str) -> PyResult<Self> {
+        let mut config = self.config.clone();
+        config
+            .options_mut()
+            .set(key, value)
+            .map_err(from_datafusion_error)?;
+        Ok(Self::from(config))
+    }
+
+    pub fn with_extension(&self, extension: Bound<PyAny>) -> PyResult<Self> {
+        if !extension.hasattr("__datafusion_extension_options__")? {
+            return Err(pyo3::exceptions::PyAttributeError::new_err(
+                "Expected extension object to define __datafusion_extension_options__()",
+            ));
+        }
+        // Routed through `call_capsule_getter` like every other getter in the
+        // family, even though this one takes no argument and so has no arity
+        // error to diagnose. The point is that the grep in the FFI capsule
+        // protocol skill turns up no exceptions.
+        let capsule = call_capsule_getter(
+            extension,
+            "__datafusion_extension_options__",
+            CapsuleGetterArg::None,
+        )?;
+        let capsule = capsule.cast::<PyCapsule>()?;
+        validate_pycapsule(capsule, "datafusion_extension_options")?;
+
+        // No `check_ffi_version` here: `FFI_ExtensionOptions` carries no
+        // version field, so there is nothing to compare.
+        let extension: NonNull<FFI_ExtensionOptions> = capsule
+            .pointer_checked(Some(c"datafusion_extension_options"))?
+            .cast();
+        let mut extension = unsafe { extension.as_ref() }.clone();
+
+        let mut config = self.config.clone();
+        let options = config.options_mut();
+        if let Some(prior_extension) = options.extensions.get::<FFI_ExtensionOptions>() {
+            extension
+                .merge(prior_extension)
+                .map_err(py_datafusion_err)?;
+        }
+
+        options.extensions.insert(extension);
+
+        Ok(Self::from(config))
+    }
+}
+
+/// Runtime options for a SessionContext
+#[pyclass(
+    from_py_object,
+    frozen,
+    name = "RuntimeEnvBuilder",
+    module = "datafusion",
+    subclass
+)]
+#[derive(Clone)]
+pub struct PyRuntimeEnvBuilder {
+    pub builder: RuntimeEnvBuilder,
+}
+
+#[pymethods]
+impl PyRuntimeEnvBuilder {
+    #[new]
+    fn new() -> Self {
+        Self {
+            builder: RuntimeEnvBuilder::default(),
+        }
+    }
+
+    fn with_disk_manager_disabled(&self) -> Self {
+        let mut runtime_builder = self.builder.clone();
+
+        let mut disk_mgr_builder = runtime_builder
+            .disk_manager_builder
+            .clone()
+            .unwrap_or_default();
+        disk_mgr_builder.set_mode(DiskManagerMode::Disabled);
+
+        runtime_builder = runtime_builder.with_disk_manager_builder(disk_mgr_builder);
+        Self {
+            builder: runtime_builder,
+        }
+    }
+
+    fn with_disk_manager_os(&self) -> Self {
+        let mut runtime_builder = self.builder.clone();
+
+        let mut disk_mgr_builder = runtime_builder
+            .disk_manager_builder
+            .clone()
+            .unwrap_or_default();
+        disk_mgr_builder.set_mode(DiskManagerMode::OsTmpDirectory);
+
+        runtime_builder = runtime_builder.with_disk_manager_builder(disk_mgr_builder);
+        Self {
+            builder: runtime_builder,
+        }
+    }
+
+    fn with_disk_manager_specified(&self, paths: Vec<String>) -> Self {
+        let paths = paths.iter().map(|s| s.into()).collect();
+        let mut runtime_builder = self.builder.clone();
+
+        let mut disk_mgr_builder = runtime_builder
+            .disk_manager_builder
+            .clone()
+            .unwrap_or_default();
+        disk_mgr_builder.set_mode(DiskManagerMode::Directories(paths));
+
+        runtime_builder = runtime_builder.with_disk_manager_builder(disk_mgr_builder);
+        Self {
+            builder: runtime_builder,
+        }
+    }
+
+    fn with_unbounded_memory_pool(&self) -> Self {
+        let builder = self.builder.clone();
+        let builder = builder.with_memory_pool(Arc::new(UnboundedMemoryPool::default()));
+        Self { builder }
+    }
+
+    fn with_fair_spill_pool(&self, size: usize) -> Self {
+        let builder = self.builder.clone();
+        let builder = builder.with_memory_pool(Arc::new(FairSpillPool::new(size)));
+        Self { builder }
+    }
+
+    fn with_greedy_memory_pool(&self, size: usize) -> Self {
+        let builder = self.builder.clone();
+        let builder = builder.with_memory_pool(Arc::new(GreedyMemoryPool::new(size)));
+        Self { builder }
+    }
+
+    fn with_temp_file_path(&self, path: &str) -> Self {
+        let builder = self.builder.clone();
+        let builder = builder.with_temp_file_path(path);
+        Self { builder }
+    }
+}
+
+/// `PySQLOptions` allows you to specify options to the sql execution.
+#[pyclass(
+    from_py_object,
+    frozen,
+    name = "SQLOptions",
+    module = "datafusion",
+    subclass
+)]
+#[derive(Clone)]
+pub struct PySQLOptions {
+    pub options: SQLOptions,
+}
+
+impl From<SQLOptions> for PySQLOptions {
+    fn from(options: SQLOptions) -> Self {
+        Self { options }
+    }
+}
+
+#[pymethods]
+impl PySQLOptions {
+    #[new]
+    fn new() -> Self {
+        let options = SQLOptions::new();
+        Self { options }
+    }
+
+    /// Should DDL data modification commands  (e.g. `CREATE TABLE`) be run? Defaults to `true`.
+    fn with_allow_ddl(&self, allow: bool) -> Self {
+        Self::from(self.options.with_allow_ddl(allow))
+    }
+
+    /// Should DML data modification commands (e.g. `INSERT and COPY`) be run? Defaults to `true`
+    pub fn with_allow_dml(&self, allow: bool) -> Self {
+        Self::from(self.options.with_allow_dml(allow))
+    }
+
+    /// Should Statements such as (e.g. `SET VARIABLE and `BEGIN TRANSACTION` ...`) be run?. Defaults to `true`
+    pub fn with_allow_statements(&self, allow: bool) -> Self {
+        Self::from(self.options.with_allow_statements(allow))
+    }
+}
+
+/// `PySessionContext` is able to plan and execute DataFusion plans.
+/// It has a powerful optimizer, a physical planner for local execution, and a
+/// multi-threaded execution engine to perform the execution.
+#[pyclass(
+    from_py_object,
+    frozen,
+    name = "SessionContext",
+    module = "datafusion",
+    subclass
+)]
+#[derive(Clone)]
+pub struct PySessionContext {
+    pub ctx: Arc<SessionContext>,
+    logical_codec: Arc<PythonLogicalCodec>,
+    physical_codec: Arc<PythonPhysicalCodec>,
+}
+
+#[pymethods]
+impl PySessionContext {
+    #[pyo3(signature = (config=None, runtime=None))]
+    #[new]
+    pub fn new(
+        config: Option<PySessionConfig>,
+        runtime: Option<PyRuntimeEnvBuilder>,
+    ) -> PyDataFusionResult<Self> {
+        let config = if let Some(c) = config {
+            c.config
+        } else {
+            SessionConfig::default().with_information_schema(true)
+        };
+        let runtime_env_builder = if let Some(c) = runtime {
+            c.builder
+        } else {
+            RuntimeEnvBuilder::default()
+        };
+        let runtime = Arc::new(runtime_env_builder.build()?);
+        let session_state = SessionStateBuilder::new()
+            .with_config(config)
+            .with_runtime_env(runtime)
+            .with_default_features()
+            .with_analyzer_rule(Arc::new(crate::analyzer::ResolveLambdaVariables::new()))
+            .build();
+        let ctx = Arc::new(SessionContext::new_with_state(session_state));
+        Ok(PySessionContext {
+            ctx,
+            logical_codec: Arc::new(PythonLogicalCodec::default()),
+            physical_codec: Arc::new(PythonPhysicalCodec::default()),
+        })
+    }
+
+    pub fn enable_url_table(&self) -> PyResult<Self> {
+        // Pre-existing caveat, unrelated to query planners: this is the one
+        // method that mints a second `Arc<SessionContext>` for a session, and
+        // it also forks the session's state while keeping its id. Any weak
+        // `FFI_TaskContextProvider` handed out by the receiver stays bound to
+        // the receiver, so the returned context must not outlive it. See
+        // `set_session_query_planner` for why everything else mutates in place.
+        // Tracked as a bug in <https://github.com/apache/datafusion-python/issues/1708>.
+        Ok(PySessionContext {
+            ctx: Arc::new(self.ctx.as_ref().clone().enable_url_table()),
+            logical_codec: Arc::clone(&self.logical_codec),
+            physical_codec: Arc::clone(&self.physical_codec),
+        })
+    }
+
+    #[staticmethod]
+    #[pyo3(signature = ())]
+    pub fn global_ctx() -> PyResult<Self> {
+        let ctx = get_global_ctx().clone();
+        Ok(Self {
+            ctx,
+            logical_codec: Arc::new(PythonLogicalCodec::default()),
+            physical_codec: Arc::new(PythonPhysicalCodec::default()),
+        })
+    }
+
+    /// Register an object store with the given name
+    #[pyo3(signature = (scheme, store, host=None))]
+    pub fn register_object_store(
+        &self,
+        scheme: &str,
+        store: StorageContexts,
+        host: Option<&str>,
+    ) -> PyResult<()> {
+        // for most stores the "host" is the bucket name and can be inferred from the store
+        let (store, upstream_host): (Arc<dyn ObjectStore>, String) = match store {
+            StorageContexts::AmazonS3(s3) => (s3.inner, s3.bucket_name),
+            StorageContexts::GoogleCloudStorage(gcs) => (gcs.inner, gcs.bucket_name),
+            StorageContexts::MicrosoftAzure(azure) => (azure.inner, azure.container_name),
+            StorageContexts::LocalFileSystem(local) => (local.inner, "".to_string()),
+            StorageContexts::HTTP(http) => (http.store, http.url),
+        };
+
+        // let users override the host to match the api signature from upstream
+        let derived_host = if let Some(host) = host {
+            host
+        } else {
+            &upstream_host
+        };
+        let url_string = format!("{scheme}{derived_host}");
+        let url = Url::parse(&url_string).map_err(|e| PyValueError::new_err(e.to_string()))?;
+        self.ctx.runtime_env().register_object_store(&url, store);
+        Ok(())
+    }
+
+    /// Deregister an object store with the given url
+    #[pyo3(signature = (scheme, host=None))]
+    pub fn deregister_object_store(
+        &self,
+        scheme: &str,
+        host: Option<&str>,
+    ) -> PyDataFusionResult<()> {
+        let host = host.unwrap_or("");
+        let url_string = format!("{scheme}{host}");
+        let url = Url::parse(&url_string).map_err(|e| PyDataFusionError::Common(e.to_string()))?;
+        self.ctx.runtime_env().deregister_object_store(&url)?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (name, path, table_partition_cols=vec![],
+    file_extension=".parquet",
+    schema=None,
+    file_sort_order=None))]
+    pub fn register_listing_table(
+        &self,
+        name: &str,
+        path: PathBuf,
+        table_partition_cols: Vec<(String, PyArrowType<DataType>)>,
+        file_extension: &str,
+        schema: Option<PyArrowType<Schema>>,
+        file_sort_order: Option<Vec<Vec<PySortExpr>>>,
+        py: Python,
+    ) -> PyDataFusionResult<()> {
+        let options = ListingOptions::new(Arc::new(ParquetFormat::new()))
+            .with_file_extension(file_extension)
+            .with_table_partition_cols(convert_partition_cols(table_partition_cols))
+            .with_file_sort_order(convert_file_sort_order(file_sort_order));
+        let table_path = ListingTableUrl::parse(path_to_str(&path)?)?;
+        let resolved_schema: SchemaRef = match schema {
+            Some(s) => Arc::new(s.0),
+            None => {
+                let state = self.ctx.state();
+                let schema = options.infer_schema(&state, &table_path);
+                wait_for_future(py, schema)??
+            }
+        };
+        let config = ListingTableConfig::new(table_path)
+            .with_listing_options(options)
+            .with_schema(resolved_schema);
+        let table = ListingTable::try_new(config)?;
+        self.ctx.register_table(name, Arc::new(table))?;
+        Ok(())
+    }
+
+    pub fn register_udtf(&self, func: PyTableFunction) {
+        let name = func.name.clone();
+        let func = Arc::new(func);
+        self.ctx.register_udtf(&name, func);
+    }
+
+    pub fn deregister_udtf(&self, name: &str) {
+        self.ctx.deregister_udtf(name);
+    }
+
+    #[pyo3(signature = (query, options=None, param_values=HashMap::default(), param_strings=HashMap::default()))]
+    pub fn sql_with_options(
+        &self,
+        py: Python,
+        mut query: String,
+        options: Option<PySQLOptions>,
+        param_values: HashMap<String, PyScalarValue>,
+        param_strings: HashMap<String, String>,
+    ) -> PyDataFusionResult<PyDataFrame> {
+        let options = if let Some(options) = options {
+            options.options
+        } else {
+            SQLOptions::new()
+        };
+
+        let param_values = param_values
+            .into_iter()
+            .map(|(name, value)| (name, ScalarValue::from(value)))
+            .collect::<HashMap<_, _>>();
+
+        let state = self.ctx.state();
+        let dialect = state.config().options().sql_parser.dialect.as_ref();
+
+        if !param_strings.is_empty() {
+            query = replace_placeholders_with_strings(&query, dialect, param_strings)?;
+        }
+
+        let mut df = wait_for_future(py, async {
+            self.ctx.sql_with_options(&query, options).await
+        })?
+        .map_err(from_datafusion_error)?;
+
+        if !param_values.is_empty() {
+            df = df.with_param_values(param_values)?;
+        }
+
+        Ok(PyDataFrame::new(df))
+    }
+
+    #[pyo3(signature = (partitions, name=None, schema=None))]
+    pub fn create_dataframe(
+        &self,
+        partitions: PyArrowType<Vec<Vec<RecordBatch>>>,
+        name: Option<&str>,
+        schema: Option<PyArrowType<Schema>>,
+        py: Python,
+    ) -> PyDataFusionResult<PyDataFrame> {
+        let schema = if let Some(schema) = schema {
+            SchemaRef::from(schema.0)
+        } else {
+            partitions.0[0][0].schema()
+        };
+
+        let table = MemTable::try_new(schema, partitions.0)?;
+
+        // generate a random (unique) name for this table if none is provided
+        // table name cannot start with numeric digit
+        let table_name = match name {
+            Some(val) => val.to_owned(),
+            None => {
+                "c".to_owned()
+                    + Uuid::new_v4()
+                        .simple()
+                        .encode_lower(&mut Uuid::encode_buffer())
+            }
+        };
+
+        self.ctx.register_table(&*table_name, Arc::new(table))?;
+
+        let table = wait_for_future(py, self._table(&table_name))??;
+
+        let df = PyDataFrame::new(table);
+        Ok(df)
+    }
+
+    /// Create a DataFrame from an existing logical plan
+    pub fn create_dataframe_from_logical_plan(&self, plan: PyLogicalPlan) -> PyDataFrame {
+        PyDataFrame::new(DataFrame::new(self.ctx.state(), plan.plan.as_ref().clone()))
+    }
+
+    /// Construct datafusion dataframe from Python list
+    #[pyo3(signature = (data, name=None))]
+    pub fn from_pylist(
+        &self,
+        data: Bound<'_, PyList>,
+        name: Option<&str>,
+    ) -> PyResult<PyDataFrame> {
+        // Acquire GIL Token
+        let py = data.py();
+
+        // Instantiate pyarrow Table object & convert to Arrow Table
+        let table_class = py.import("pyarrow")?.getattr("Table")?;
+        let args = PyTuple::new(py, &[data])?;
+        let table = table_class.call_method1("from_pylist", args)?;
+
+        // Convert Arrow Table to datafusion DataFrame
+        let df = self.from_arrow(table, name, py)?;
+        Ok(df)
+    }
+
+    /// Construct datafusion dataframe from Python dictionary
+    #[pyo3(signature = (data, name=None))]
+    pub fn from_pydict(
+        &self,
+        data: Bound<'_, PyDict>,
+        name: Option<&str>,
+    ) -> PyResult<PyDataFrame> {
+        // Acquire GIL Token
+        let py = data.py();
+
+        // Instantiate pyarrow Table object & convert to Arrow Table
+        let table_class = py.import("pyarrow")?.getattr("Table")?;
+        let args = PyTuple::new(py, &[data])?;
+        let table = table_class.call_method1("from_pydict", args)?;
+
+        // Convert Arrow Table to datafusion DataFrame
+        let df = self.from_arrow(table, name, py)?;
+        Ok(df)
+    }
+
+    /// Construct datafusion dataframe from Arrow Table
+    #[pyo3(signature = (data, name=None))]
+    pub fn from_arrow(
+        &self,
+        data: Bound<'_, PyAny>,
+        name: Option<&str>,
+        py: Python,
+    ) -> PyDataFusionResult<PyDataFrame> {
+        let (schema, batches) =
+            if let Ok(stream_reader) = ArrowArrayStreamReader::from_pyarrow_bound(&data) {
+                // Works for any object that implements __arrow_c_stream__ in pycapsule.
+
+                let schema = stream_reader.schema().as_ref().to_owned();
+                let batches = stream_reader
+                    .collect::<Result<Vec<RecordBatch>, arrow::error::ArrowError>>()?;
+
+                (schema, batches)
+            } else if let Ok(array) = RecordBatch::from_pyarrow_bound(&data) {
+                // While this says RecordBatch, it will work for any object that implements
+                // __arrow_c_array__ and returns a StructArray.
+
+                (array.schema().as_ref().to_owned(), vec![array])
+            } else {
+                return Err(PyDataFusionError::Common(
+                    "Expected either a Arrow Array or Arrow Stream in from_arrow().".to_string(),
+                ));
+            };
+
+        // Because create_dataframe() expects a vector of vectors of record batches
+        // here we need to wrap the vector of record batches in an additional vector
+        let list_of_batches = PyArrowType::from(vec![batches]);
+        self.create_dataframe(list_of_batches, name, Some(schema.into()), py)
+    }
+
+    /// Construct datafusion dataframe from pandas
+    #[allow(clippy::wrong_self_convention)]
+    #[pyo3(signature = (data, name=None))]
+    pub fn from_pandas(&self, data: Bound<'_, PyAny>, name: Option<&str>) -> PyResult<PyDataFrame> {
+        // Obtain GIL token
+        let py = data.py();
+
+        // Instantiate pyarrow Table object & convert to Arrow Table
+        let table_class = py.import("pyarrow")?.getattr("Table")?;
+        let args = PyTuple::new(py, &[data])?;
+        let table = table_class.call_method1("from_pandas", args)?;
+
+        // Convert Arrow Table to datafusion DataFrame
+        let df = self.from_arrow(table, name, py)?;
+        Ok(df)
+    }
+
+    /// Construct datafusion dataframe from polars
+    #[pyo3(signature = (data, name=None))]
+    pub fn from_polars(&self, data: Bound<'_, PyAny>, name: Option<&str>) -> PyResult<PyDataFrame> {
+        // Convert Polars dataframe to Arrow Table
+        let table = data.call_method0("to_arrow")?;
+
+        // Convert Arrow Table to datafusion DataFrame
+        let df = self.from_arrow(table, name, data.py())?;
+        Ok(df)
+    }
+
+    pub fn register_table(&self, name: &str, table: Bound<'_, PyAny>) -> PyDataFusionResult<()> {
+        let session = self.clone().into_bound_py_any(table.py())?;
+        let table = PyTable::new(table, Some(session))?;
+
+        self.ctx.register_table(name, table.table)?;
+        Ok(())
+    }
+
+    pub fn deregister_table(&self, name: &str) -> PyDataFusionResult<()> {
+        self.ctx.deregister_table(name)?;
+        Ok(())
+    }
+
+    pub fn register_table_factory(
+        &self,
+        format: &str,
+        mut factory: Bound<'_, PyAny>,
+    ) -> PyDataFusionResult<()> {
+        if factory.hasattr("__datafusion_table_provider_factory__")? {
+            let py = factory.py();
+            let ffi = self.ffi_logical_codec();
+            let codec_capsule = create_logical_extension_capsule(py, ffi.as_ref())?;
+            factory = call_capsule_getter(
+                factory,
+                "__datafusion_table_provider_factory__",
+                CapsuleGetterArg::LogicalCodec(&codec_capsule),
+            )?;
+        }
+
+        let factory: Arc<dyn TableProviderFactory> =
+            if let Ok(capsule) = factory.cast::<PyCapsule>().map_err(py_datafusion_err) {
+                let data: NonNull<FFI_TableProviderFactory> = capsule
+                    .pointer_checked(Some(c"datafusion_table_provider_factory"))?
+                    .cast();
+                let factory = unsafe { data.as_ref() };
+                factory.into()
+            } else {
+                Arc::new(RustWrappedPyTableProviderFactory::new(
+                    factory.into(),
+                    self.ffi_logical_codec(),
+                ))
+            };
+
+        let st = self.ctx.state_ref();
+        let mut lock = st.write();
+        lock.table_factories_mut()
+            .insert(format.to_owned(), factory);
+
+        Ok(())
+    }
+
+    pub fn register_catalog_provider_list(
+        &self,
+        mut provider: Bound<PyAny>,
+    ) -> PyDataFusionResult<()> {
+        if provider.hasattr("__datafusion_catalog_provider_list__")? {
+            let py = provider.py();
+            let ffi = self.ffi_logical_codec();
+            let codec_capsule = create_logical_extension_capsule(py, ffi.as_ref())?;
+            provider = call_capsule_getter(
+                provider,
+                "__datafusion_catalog_provider_list__",
+                CapsuleGetterArg::LogicalCodec(&codec_capsule),
+            )?;
+        }
+
+        let provider = if let Ok(capsule) = provider.cast::<PyCapsule>() {
+            let data: NonNull<FFI_CatalogProviderList> = capsule
+                .pointer_checked(Some(c"datafusion_catalog_provider_list"))?
+                .cast();
+            let provider = unsafe { data.as_ref() };
+            let provider: Arc<dyn CatalogProviderList> = provider.into();
+            provider
+        } else {
+            match provider.extract::<PyCatalogList>() {
+                Ok(py_catalog_list) => py_catalog_list.catalog_list,
+                Err(_) => Arc::new(RustWrappedPyCatalogProviderList::new(
+                    provider.into(),
+                    self.ffi_logical_codec(),
+                )) as Arc<dyn CatalogProviderList>,
+            }
+        };
+
+        self.ctx.register_catalog_list(provider);
+
+        Ok(())
+    }
+
+    pub fn register_catalog_provider(
+        &self,
+        name: &str,
+        mut provider: Bound<'_, PyAny>,
+    ) -> PyDataFusionResult<()> {
+        if provider.hasattr("__datafusion_catalog_provider__")? {
+            let py = provider.py();
+            let ffi = self.ffi_logical_codec();
+            let codec_capsule = create_logical_extension_capsule(py, ffi.as_ref())?;
+            provider = call_capsule_getter(
+                provider,
+                "__datafusion_catalog_provider__",
+                CapsuleGetterArg::LogicalCodec(&codec_capsule),
+            )?;
+        }
+
+        let provider = if let Ok(capsule) = provider.cast::<PyCapsule>() {
+            let data: NonNull<FFI_CatalogProvider> = capsule
+                .pointer_checked(Some(c"datafusion_catalog_provider"))?
+                .cast();
+            let provider = unsafe { data.as_ref() };
+            let provider: Arc<dyn CatalogProvider> = provider.into();
+            provider
+        } else {
+            match provider.extract::<PyCatalog>() {
+                Ok(py_catalog) => py_catalog.catalog,
+                Err(_) => Arc::new(RustWrappedPyCatalogProvider::new(
+                    provider.into(),
+                    self.ffi_logical_codec(),
+                )) as Arc<dyn CatalogProvider>,
+            }
+        };
+
+        let _ = self.ctx.register_catalog(name, provider);
+
+        Ok(())
+    }
+
+    /// Construct datafusion dataframe from Arrow Table
+    pub fn register_table_provider(
+        &self,
+        name: &str,
+        provider: Bound<'_, PyAny>,
+    ) -> PyDataFusionResult<()> {
+        // Deprecated: use `register_table` instead
+        self.register_table(name, provider)
+    }
+
+    pub fn register_record_batches(
+        &self,
+        name: &str,
+        partitions: PyArrowType<Vec<Vec<RecordBatch>>>,
+    ) -> PyDataFusionResult<()> {
+        // Take the schema from the first available batch; error instead of
+        // panicking when the partitions hold no batches.
+        let schema = partitions
+            .0
+            .iter()
+            .find_map(|partition| partition.first())
+            .ok_or_else(|| {
+                PyValueError::new_err(
+                    "Cannot register record batches without a schema: the \
+                     provided partitions contain no record batches.",
+                )
+            })?
+            .schema();
+        let table = MemTable::try_new(schema, partitions.0)?;
+        self.ctx.register_table(name, Arc::new(table))?;
+        Ok(())
+    }
+
+    pub fn read_batches(
+        &self,
+        batches: PyArrowType<Vec<RecordBatch>>,
+    ) -> PyDataFusionResult<PyDataFrame> {
+        Ok(PyDataFrame::new(self.ctx.read_batches(batches.0)?))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (name, path, table_partition_cols=vec![],
+                        parquet_pruning=true,
+                        file_extension=".parquet",
+                        skip_metadata=true,
+                        schema=None,
+                        file_sort_order=None))]
+    pub fn register_parquet(
+        &self,
+        name: &str,
+        path: PathBuf,
+        table_partition_cols: Vec<(String, PyArrowType<DataType>)>,
+        parquet_pruning: bool,
+        file_extension: &str,
+        skip_metadata: bool,
+        schema: Option<PyArrowType<Schema>>,
+        file_sort_order: Option<Vec<Vec<PySortExpr>>>,
+        py: Python,
+    ) -> PyDataFusionResult<()> {
+        let options = build_parquet_options(
+            table_partition_cols,
+            parquet_pruning,
+            file_extension,
+            skip_metadata,
+            &schema,
+            file_sort_order,
+        );
+        wait_for_future(
+            py,
+            self.ctx
+                .register_parquet(name, path_to_str(&path)?, options),
+        )??;
+        Ok(())
+    }
+
+    #[pyo3(signature = (name,
+                        path,
+                        options=None))]
+    pub fn register_csv(
+        &self,
+        name: &str,
+        path: &Bound<'_, PyAny>,
+        options: Option<&PyCsvReadOptions>,
+        py: Python,
+    ) -> PyDataFusionResult<()> {
+        let options = convert_csv_options(options)?;
+
+        if path.is_instance_of::<PyList>() {
+            let paths = path
+                .extract::<Vec<PathBuf>>()?
+                .iter()
+                .map(|p| path_to_str(p).map(str::to_owned))
+                .collect::<PyDataFusionResult<Vec<_>>>()?;
+            wait_for_future(
+                py,
+                self.register_csv_from_multiple_paths(name, paths, options),
+            )??;
+        } else {
+            let path = path.extract::<PathBuf>()?;
+            wait_for_future(
+                py,
+                self.ctx.register_csv(name, path_to_str(&path)?, options),
+            )??;
+        }
+
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (name,
+                        path,
+                        schema=None,
+                        schema_infer_max_records=1000,
+                        file_extension=".json",
+                        table_partition_cols=vec![],
+                        file_compression_type=None))]
+    pub fn register_json(
+        &self,
+        name: &str,
+        path: PathBuf,
+        schema: Option<PyArrowType<Schema>>,
+        schema_infer_max_records: usize,
+        file_extension: &str,
+        table_partition_cols: Vec<(String, PyArrowType<DataType>)>,
+        file_compression_type: Option<String>,
+        py: Python,
+    ) -> PyDataFusionResult<()> {
+        let options = build_json_options(
+            table_partition_cols,
+            file_compression_type,
+            schema_infer_max_records,
+            file_extension,
+            &schema,
+        )?;
+        wait_for_future(
+            py,
+            self.ctx.register_json(name, path_to_str(&path)?, options),
+        )??;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (name,
+                        path,
+                        schema=None,
+                        file_extension=".avro",
+                        table_partition_cols=vec![]))]
+    pub fn register_avro(
+        &self,
+        name: &str,
+        path: PathBuf,
+        schema: Option<PyArrowType<Schema>>,
+        file_extension: &str,
+        table_partition_cols: Vec<(String, PyArrowType<DataType>)>,
+        py: Python,
+    ) -> PyDataFusionResult<()> {
+        let options = build_avro_options(table_partition_cols, file_extension, &schema);
+        wait_for_future(
+            py,
+            self.ctx.register_avro(name, path_to_str(&path)?, options),
+        )??;
+        Ok(())
+    }
+
+    #[pyo3(signature = (name, path, schema=None, file_extension=".arrow", table_partition_cols=vec![]))]
+    pub fn register_arrow(
+        &self,
+        name: &str,
+        path: PathBuf,
+        schema: Option<PyArrowType<Schema>>,
+        file_extension: &str,
+        table_partition_cols: Vec<(String, PyArrowType<DataType>)>,
+        py: Python,
+    ) -> PyDataFusionResult<()> {
+        let options = build_arrow_options(table_partition_cols, file_extension, &schema);
+        wait_for_future(
+            py,
+            self.ctx.register_arrow(name, path_to_str(&path)?, options),
+        )??;
+        Ok(())
+    }
+
+    pub fn register_batch(
+        &self,
+        name: &str,
+        batch: PyArrowType<RecordBatch>,
+    ) -> PyDataFusionResult<()> {
+        self.ctx.register_batch(name, batch.0)?;
+        Ok(())
+    }
+
+    // Registers a PyArrow.Dataset
+    pub fn register_dataset(
+        &self,
+        name: &str,
+        dataset: &Bound<'_, PyAny>,
+        py: Python,
+    ) -> PyDataFusionResult<()> {
+        let table: Arc<dyn TableProvider> = Arc::new(Dataset::new(dataset, py)?);
+
+        self.ctx.register_table(name, table)?;
+
+        Ok(())
+    }
+
+    pub fn register_udf(&self, udf: PyScalarUDF) -> PyResult<()> {
+        self.ctx.register_udf(udf.function);
+        Ok(())
+    }
+
+    pub fn deregister_udf(&self, name: &str) {
+        self.ctx.deregister_udf(name);
+    }
+
+    pub fn register_udaf(&self, udaf: PyAggregateUDF) -> PyResult<()> {
+        self.ctx.register_udaf(udaf.function);
+        Ok(())
+    }
+
+    /// Register all `datafusion-spark` UDFs/UDAFs/UDWFs, overriding any built-in
+    /// DataFusion functions of the same name with their Spark-semantics version.
+    pub fn enable_spark_functions(&self) -> PyResult<()> {
+        for udf in datafusion_spark::all_default_scalar_functions() {
+            self.ctx.register_udf((*udf).clone());
+        }
+        for udaf in datafusion_spark::all_default_aggregate_functions() {
+            self.ctx.register_udaf((*udaf).clone());
+        }
+        for udwf in datafusion_spark::all_default_window_functions() {
+            self.ctx.register_udwf((*udwf).clone());
+        }
+        Ok(())
+    }
+
+    pub fn deregister_udaf(&self, name: &str) {
+        self.ctx.deregister_udaf(name);
+    }
+
+    pub fn register_udwf(&self, udwf: PyWindowUDF) -> PyResult<()> {
+        self.ctx.register_udwf(udwf.function);
+        Ok(())
+    }
+
+    pub fn deregister_udwf(&self, name: &str) {
+        self.ctx.deregister_udwf(name);
+    }
+
+    pub fn udf(&self, name: &str) -> PyResult<PyScalarUDF> {
+        if !self.ctx.udfs().contains(name) {
+            return Err(PyKeyError::new_err(format!("no UDF named '{name}'")));
+        }
+        let function = (*self.ctx.udf(name).map_err(py_datafusion_err)?).clone();
+        Ok(PyScalarUDF { function })
+    }
+
+    pub fn udaf(&self, name: &str) -> PyResult<PyAggregateUDF> {
+        if !self.ctx.udafs().contains(name) {
+            return Err(PyKeyError::new_err(format!("no UDAF named '{name}'")));
+        }
+        let function = (*self.ctx.udaf(name).map_err(py_datafusion_err)?).clone();
+        Ok(PyAggregateUDF { function })
+    }
+
+    pub fn udwf(&self, name: &str) -> PyResult<PyWindowUDF> {
+        if !self.ctx.udwfs().contains(name) {
+            return Err(PyKeyError::new_err(format!("no UDWF named '{name}'")));
+        }
+        let function = (*self.ctx.udwf(name).map_err(py_datafusion_err)?).clone();
+        Ok(PyWindowUDF { function })
+    }
+
+    pub fn udfs(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.ctx.udfs().into_iter().collect();
+        names.sort();
+        names
+    }
+
+    pub fn udafs(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.ctx.udafs().into_iter().collect();
+        names.sort();
+        names
+    }
+
+    pub fn udwfs(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.ctx.udwfs().into_iter().collect();
+        names.sort();
+        names
+    }
+
+    #[pyo3(signature = (name="datafusion"))]
+    pub fn catalog(&self, py: Python, name: &str) -> PyResult<Py<PyAny>> {
+        let catalog = self.ctx.catalog(name).ok_or(PyKeyError::new_err(format!(
+            "Catalog with name {name} doesn't exist."
+        )))?;
+
+        match catalog.downcast_ref::<RustWrappedPyCatalogProvider>() {
+            Some(wrapped_schema) => Ok(wrapped_schema.catalog_provider.clone_ref(py)),
+            None => {
+                Ok(PyCatalog::new_from_parts(catalog, self.ffi_logical_codec()).into_py_any(py)?)
+            }
+        }
+    }
+
+    pub fn catalog_names(&self) -> HashSet<String> {
+        self.ctx.catalog_names().into_iter().collect()
+    }
+
+    pub fn table(&self, name: &str, py: Python) -> PyResult<PyDataFrame> {
+        let res = wait_for_future(py, self.ctx.table(name))
+            .map_err(|e| PyKeyError::new_err(e.to_string()))?;
+        match res {
+            Ok(df) => Ok(PyDataFrame::new(df)),
+            Err(e) => {
+                if let datafusion::error::DataFusionError::Plan(msg) = &e
+                    && msg.contains("No table named")
+                {
+                    return Err(PyKeyError::new_err(msg.to_string()));
+                }
+                Err(py_datafusion_err(e))
+            }
+        }
+    }
+
+    pub fn table_exist(&self, name: &str) -> PyDataFusionResult<bool> {
+        Ok(self.ctx.table_exist(name)?)
+    }
+
+    pub fn empty_table(&self) -> PyDataFusionResult<PyDataFrame> {
+        Ok(PyDataFrame::new(self.ctx.read_empty()?))
+    }
+
+    pub fn session_id(&self) -> String {
+        self.ctx.session_id()
+    }
+
+    /// Return a copy of the active `SessionConfig`. Mutating the returned
+    /// config does not affect this context.
+    pub fn copied_config(&self) -> PySessionConfig {
+        self.ctx.copied_config().into()
+    }
+
+    /// Parse a string like `"100M"`, `"1.5G"`, or `"512K"` into a byte count.
+    /// `"0"` is accepted and returns 0. Use this when constructing a
+    /// `RuntimeEnvBuilder` from a human-friendly size string.
+    #[staticmethod]
+    pub fn parse_capacity_limit(config_name: &str, limit: &str) -> PyDataFusionResult<usize> {
+        Ok(SessionContext::parse_capacity_limit(config_name, limit)?)
+    }
+
+    pub fn session_start_time(&self) -> String {
+        self.ctx.session_start_time().to_rfc3339()
+    }
+
+    pub fn enable_ident_normalization(&self) -> bool {
+        self.ctx.enable_ident_normalization()
+    }
+
+    pub fn parse_sql_expr(&self, sql: &str, schema: PyDFSchema) -> PyDataFusionResult<PyExpr> {
+        let df_schema: DFSchema = schema.into();
+        Ok(self.ctx.parse_sql_expr(sql, &df_schema)?.into())
+    }
+
+    pub fn execute_logical_plan(
+        &self,
+        plan: PyLogicalPlan,
+        py: Python,
+    ) -> PyDataFusionResult<PyDataFrame> {
+        let df = wait_for_future(
+            py,
+            self.ctx.execute_logical_plan(plan.plan.as_ref().clone()),
+        )??;
+        Ok(PyDataFrame::new(df))
+    }
+
+    pub fn refresh_catalogs(&self, py: Python) -> PyDataFusionResult<()> {
+        wait_for_future(py, self.ctx.refresh_catalogs())??;
+        Ok(())
+    }
+
+    pub fn remove_optimizer_rule(&self, name: &str) -> bool {
+        self.ctx.remove_optimizer_rule(name)
+    }
+
+    pub fn add_physical_optimizer_rule(&self, rule: Bound<'_, PyAny>) -> PyDataFusionResult<()> {
+        let rule = physical_optimizer_rule_from_pycapsule(&rule)?;
+        let state_ref = self.ctx.state_ref();
+        let mut guard = state_ref.write();
+        // Rebuilding through the builder mints a fresh session id, but this
+        // mutates the caller's own session rather than deriving a new one, so
+        // the id has to survive. See `set_session_query_planner` for why losing
+        // it leaves `session_id()` disagreeing with every `TaskContext` the
+        // session hands out.
+        let new_state = SessionStateBuilder::new_from_existing(guard.clone())
+            .with_session_id(guard.session_id().to_string())
+            .with_physical_optimizer_rule(rule)
+            .build();
+        *guard = new_state;
+        Ok(())
+    }
+
+    /// Install a foreign query planner on this session.
+    ///
+    /// A session holds exactly one planner, so this replaces whichever one is
+    /// installed. It mutates the session rather than deriving a new one, the
+    /// same way `add_physical_optimizer_rule` does; see
+    /// [`Self::set_session_query_planner`] for why that matters to FFI handles.
+    pub fn set_query_planner(
+        slf: &Bound<'_, Self>,
+        planner: Bound<'_, PyAny>,
+    ) -> PyDataFusionResult<()> {
+        let planner = ffi_query_planner_from_pycapsule(&planner, Some(slf.as_any()))?;
+        slf.borrow().set_session_query_planner(Some(planner));
+        Ok(())
+    }
+
+    pub fn table_provider(&self, name: &str, py: Python) -> PyResult<PyTable> {
+        let provider = wait_for_future(py, self.ctx.table_provider(name))
+            // Outer error: runtime/async failure
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
+            // Inner error: table not found
+            .map_err(|e| PyKeyError::new_err(e.to_string()))?;
+        Ok(PyTable { table: provider })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (path, schema=None, schema_infer_max_records=1000, file_extension=".json", table_partition_cols=vec![], file_compression_type=None))]
+    pub fn read_json(
+        &self,
+        path: PathBuf,
+        schema: Option<PyArrowType<Schema>>,
+        schema_infer_max_records: usize,
+        file_extension: &str,
+        table_partition_cols: Vec<(String, PyArrowType<DataType>)>,
+        file_compression_type: Option<String>,
+        py: Python,
+    ) -> PyDataFusionResult<PyDataFrame> {
+        let options = build_json_options(
+            table_partition_cols,
+            file_compression_type,
+            schema_infer_max_records,
+            file_extension,
+            &schema,
+        )?;
+        let df = wait_for_future(py, self.ctx.read_json(path_to_str(&path)?, options))??;
+        Ok(PyDataFrame::new(df))
+    }
+
+    #[pyo3(signature = (
+        path,
+        options=None))]
+    pub fn read_csv(
+        &self,
+        path: &Bound<'_, PyAny>,
+        options: Option<&PyCsvReadOptions>,
+        py: Python,
+    ) -> PyDataFusionResult<PyDataFrame> {
+        let options = convert_csv_options(options)?;
+
+        let paths: Vec<String> = if path.is_instance_of::<PyList>() {
+            path.extract::<Vec<PathBuf>>()?
+                .iter()
+                .map(|p| path_to_str(p).map(str::to_owned))
+                .collect::<PyDataFusionResult<_>>()?
+        } else {
+            vec![path_to_str(&path.extract::<PathBuf>()?)?.to_owned()]
+        };
+        let df = wait_for_future(py, self.ctx.read_csv(paths, options))??;
+        Ok(PyDataFrame::new(df))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (
+        path,
+        table_partition_cols=vec![],
+        parquet_pruning=true,
+        file_extension=".parquet",
+        skip_metadata=true,
+        schema=None,
+        file_sort_order=None))]
+    pub fn read_parquet(
+        &self,
+        path: PathBuf,
+        table_partition_cols: Vec<(String, PyArrowType<DataType>)>,
+        parquet_pruning: bool,
+        file_extension: &str,
+        skip_metadata: bool,
+        schema: Option<PyArrowType<Schema>>,
+        file_sort_order: Option<Vec<Vec<PySortExpr>>>,
+        py: Python,
+    ) -> PyDataFusionResult<PyDataFrame> {
+        let options = build_parquet_options(
+            table_partition_cols,
+            parquet_pruning,
+            file_extension,
+            skip_metadata,
+            &schema,
+            file_sort_order,
+        );
+        let df = PyDataFrame::new(wait_for_future(
+            py,
+            self.ctx.read_parquet(path_to_str(&path)?, options),
+        )??);
+        Ok(df)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (path, schema=None, table_partition_cols=vec![], file_extension=".avro"))]
+    pub fn read_avro(
+        &self,
+        path: PathBuf,
+        schema: Option<PyArrowType<Schema>>,
+        table_partition_cols: Vec<(String, PyArrowType<DataType>)>,
+        file_extension: &str,
+        py: Python,
+    ) -> PyDataFusionResult<PyDataFrame> {
+        let options = build_avro_options(table_partition_cols, file_extension, &schema);
+        let df = wait_for_future(py, self.ctx.read_avro(path_to_str(&path)?, options))??;
+        Ok(PyDataFrame::new(df))
+    }
+
+    #[pyo3(signature = (path, schema=None, file_extension=".arrow", table_partition_cols=vec![]))]
+    pub fn read_arrow(
+        &self,
+        path: PathBuf,
+        schema: Option<PyArrowType<Schema>>,
+        file_extension: &str,
+        table_partition_cols: Vec<(String, PyArrowType<DataType>)>,
+        py: Python,
+    ) -> PyDataFusionResult<PyDataFrame> {
+        let options = build_arrow_options(table_partition_cols, file_extension, &schema);
+        let df = wait_for_future(py, self.ctx.read_arrow(path_to_str(&path)?, options))??;
+        Ok(PyDataFrame::new(df))
+    }
+
+    pub fn read_table(&self, table: Bound<'_, PyAny>) -> PyDataFusionResult<PyDataFrame> {
+        let session = self.clone().into_bound_py_any(table.py())?;
+        let table = PyTable::new(table, Some(session))?;
+        let df = self.ctx.read_table(table.table())?;
+        Ok(PyDataFrame::new(df))
+    }
+
+    fn __repr__(&self) -> PyResult<String> {
+        let config = self.ctx.copied_config();
+        let mut config_entries = config
+            .options()
+            .entries()
+            .iter()
+            .filter(|e| e.value.is_some())
+            .map(|e| format!("{} = {}", e.key, e.value.as_ref().unwrap()))
+            .collect::<Vec<_>>();
+        config_entries.sort();
+        Ok(format!(
+            "SessionContext: id={}; configs=[\n\t{}]",
+            self.session_id(),
+            config_entries.join("\n\t")
+        ))
+    }
+
+    /// Execute a partition of an execution plan and return a stream of record batches
+    pub fn execute(
+        &self,
+        plan: PyExecutionPlan,
+        partition: usize,
+        py: Python,
+    ) -> PyDataFusionResult<PyRecordBatchStream> {
+        let plan = plan.plan.clone();
+        let partition_count = plan.output_partitioning().partition_count();
+        if partition >= partition_count {
+            return Err(PyValueError::new_err(format!(
+                "Partition index {partition} is out of range for a plan with \
+                 {partition_count} partition(s)"
+            ))
+            .into());
+        }
+        let ctx: TaskContext = TaskContext::from(&self.ctx.state());
+        let stream = spawn_future(py, async move { plan.execute(partition, Arc::new(ctx)) })?;
+        Ok(PyRecordBatchStream::new(stream))
+    }
+
+    pub fn __datafusion_task_context_provider__<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> PyResult<Bound<'py, PyCapsule>> {
+        let ctx_provider = Arc::clone(&self.ctx) as Arc<dyn TaskContextProvider>;
+        let ffi_ctx_provider = FFI_TaskContextProvider::from(&ctx_provider);
+
+        PyCapsule::new_with_value(py, ffi_ctx_provider, cr"datafusion_task_context_provider")
+    }
+
+    /// Identity this session's codec stack carries when it is itself installed
+    /// as an extension codec on another session.
+    ///
+    /// Without it the id would be derived from the class, which every session
+    /// shares: two sessions installed on one target would collide at install
+    /// time, and a payload written through one would resolve to the other on
+    /// decode. See [`SESSION_CODEC_ID_PREFIX`].
+    ///
+    /// Handles derived from one session — `with_python_udf_inlining`,
+    /// `with_logical_extension_codec`, [`Self::_install_extension_codecs`] —
+    /// report the same id even though their codec chains differ, so installing
+    /// two of them on one target is refused. That is the intended answer: they
+    /// share a `state_ref`, so their payloads would resolve against the same
+    /// session and are indistinguishable on decode. Every derivation shares the
+    /// session for exactly this reason; `enable_url_table` is the one that does
+    /// not, and it is tracked as a bug.
+    #[getter]
+    pub fn __datafusion_codec_id__(&self) -> String {
+        format!("{SESSION_CODEC_ID_PREFIX}{}", self.ctx.session_id())
+    }
+
+    /// `session` exists so this matches the protocol an extension library
+    /// implements, where the argument is how the library reaches the session
+    /// it is being installed on. A session already is one, so it is ignored.
+    #[pyo3(signature = (session=None))]
+    pub fn __datafusion_logical_extension_codec__<'py>(
+        &self,
+        py: Python<'py>,
+        session: Option<Bound<'py, PyAny>>,
+    ) -> PyResult<Bound<'py, PyCapsule>> {
+        let _ = session;
+        create_logical_extension_capsule(py, self.ffi_logical_codec().as_ref())
+    }
+
+    /// See [`Self::__datafusion_logical_extension_codec__`] for `session`.
+    #[pyo3(signature = (session=None))]
+    pub fn __datafusion_query_planner__<'py>(
+        &self,
+        py: Python<'py>,
+        session: Option<Bound<'py, PyAny>>,
+    ) -> PyResult<Bound<'py, PyCapsule>> {
+        let _ = session;
+        // An already-foreign planner is re-exported as its original handle
+        // rather than gaining another layer, because `new_with_ffi_codecs`
+        // unwraps a `ForeignQueryPlanner`. It still adopts the codecs supplied
+        // here, so a consumer that wraps this capsule decodes our plans with
+        // our codecs.
+        let planner = Arc::clone(self.ctx.state().query_planner());
+        let ffi = FFI_QueryPlanner::new_with_ffi_codecs(
+            planner,
+            Self::ffi_logical_codec_for(&self.ctx, &self.logical_codec),
+            Self::ffi_physical_codec_for(&self.ctx, &self.physical_codec),
+        );
+        create_query_planner_capsule(py, &ffi)
+    }
+
+    #[pyo3(signature = (codec, codec_id=None))]
+    pub fn with_logical_extension_codec<'py>(
+        slf: &Bound<'py, Self>,
+        codec: Bound<'py, PyAny>,
+        codec_id: Option<String>,
+    ) -> PyDataFusionResult<Self> {
+        let id = {
+            let this = slf.borrow();
+            resolve_codec_id(&codec, codec_id, &this.logical_codec.codec_ids())?
+        };
+        let inner_ffi = ffi_logical_codec_from_pycapsule(codec, Some(slf.as_any()))?;
+        let inner: Arc<dyn LogicalExtensionCodec> = (&inner_ffi).into();
+
+        let this = slf.borrow();
+        // Append rather than replace: previously installed codecs stay active,
+        // and every payload this one writes is tagged with `id` so decoding
+        // reaches it directly rather than by trying codecs in turn. Appending
+        // also carries the receiver's inlining setting over, which a fresh
+        // `PythonLogicalCodec::new` would not — it defaults inlining to on, and
+        // would silently re-enable inline Python UDF encoding on a context that
+        // had opted out with `with_python_udf_inlining(enabled=False)`.
+        let logical_codec = Arc::new(this.logical_codec.with_additional_codec(id, inner));
+        let derived = Self {
+            ctx: Arc::clone(&this.ctx),
+            logical_codec,
+            physical_codec: Arc::clone(&this.physical_codec),
+        };
+        // The session is shared, and an installed foreign planner holds the
+        // codecs it was built with, so it has to be rebuilt against this one.
+        derived.set_session_query_planner(None);
+        Ok(derived)
+    }
+
+    /// Ids of the logical extension codecs installed on this session, in
+    /// install order — the same order encoding consults them in, and the keys
+    /// a payload names when it is decoded.
+    pub fn logical_extension_codec_ids(&self) -> Vec<String> {
+        self.logical_codec
+            .codec_ids()
+            .into_iter()
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// Ids of the physical extension codecs installed on this session.
+    /// See [`Self::logical_extension_codec_ids`].
+    pub fn physical_extension_codec_ids(&self) -> Vec<String> {
+        self.physical_codec
+            .codec_ids()
+            .into_iter()
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// See [`Self::__datafusion_logical_extension_codec__`] for `session`.
+    #[pyo3(signature = (session=None))]
+    pub fn __datafusion_physical_extension_codec__<'py>(
+        &self,
+        py: Python<'py>,
+        session: Option<Bound<'py, PyAny>>,
+    ) -> PyResult<Bound<'py, PyCapsule>> {
+        let _ = session;
+        create_physical_extension_capsule(py, self.ffi_physical_codec().as_ref())
+    }
+
+    #[pyo3(signature = (codec, codec_id=None))]
+    pub fn with_physical_extension_codec<'py>(
+        slf: &Bound<'py, Self>,
+        codec: Bound<'py, PyAny>,
+        codec_id: Option<String>,
+    ) -> PyDataFusionResult<Self> {
+        let id = {
+            let this = slf.borrow();
+            resolve_codec_id(&codec, codec_id, &this.physical_codec.codec_ids())?
+        };
+        let inner_ffi = ffi_physical_codec_from_pycapsule(codec, Some(slf.as_any()))?;
+        let inner: Arc<dyn PhysicalExtensionCodec> = (&inner_ffi).into();
+
+        let this = slf.borrow();
+        // See `with_logical_extension_codec` for why this appends rather than
+        // replaces, and why that is also what carries the inlining flag over.
+        let physical_codec = Arc::new(this.physical_codec.with_additional_codec(id, inner));
+        let derived = Self {
+            ctx: Arc::clone(&this.ctx),
+            logical_codec: Arc::clone(&this.logical_codec),
+            physical_codec,
+        };
+        // See `with_logical_extension_codec`.
+        derived.set_session_query_planner(None);
+        Ok(derived)
+    }
+
+    pub fn with_python_udf_inlining(&self, enabled: bool) -> Self {
+        // Rebinding the session's planner is a side effect on state shared with
+        // every other handle, so do not pay it for a call that changes nothing.
+        // A defensive `with_python_udf_inlining(enabled=True)` on a context that
+        // already inlines would otherwise rebind the session's planner to this
+        // handle's codecs, and callers routinely discard the result. Returning
+        // the codecs as-is is observationally equivalent to the rebuild below,
+        // which clones the same codec chain and only flips the flag.
+        if self.logical_codec.python_udf_inlining() == enabled
+            && self.physical_codec.python_udf_inlining() == enabled
+        {
+            return Self {
+                ctx: Arc::clone(&self.ctx),
+                logical_codec: Arc::clone(&self.logical_codec),
+                physical_codec: Arc::clone(&self.physical_codec),
+            };
+        }
+
+        let logical_codec = Arc::new(
+            self.logical_codec
+                .as_ref()
+                .clone()
+                .with_python_udf_inlining(enabled),
+        );
+        let physical_codec = Arc::new(
+            self.physical_codec
+                .as_ref()
+                .clone()
+                .with_python_udf_inlining(enabled),
+        );
+        let derived = Self {
+            ctx: Arc::clone(&self.ctx),
+            logical_codec,
+            physical_codec,
+        };
+        // See `with_logical_extension_codec`.
+        derived.set_session_query_planner(None);
+        derived
+    }
+
+    /// Build the codec chains for a `with_extensions` call.
+    ///
+    /// Private support method for `SessionContext.with_extensions`, and the
+    /// first of the two phases that method runs. `self` is the context the
+    /// extensions bound their components against, and is also the
+    /// `Arc<SessionContext>` every FFI task-context provider they created
+    /// targets, so the returned handle shares it rather than deriving a new
+    /// one.
+    ///
+    /// **Writes nothing.** The codec chains belong to the returned handle
+    /// rather than to `SessionState`, so this phase is transactional for free:
+    /// a codec that fails to import, or that collides with an installed id,
+    /// leaves the caller's context exactly as it was. Binding the planner is
+    /// the only step that touches the session, and it is deferred to
+    /// [`Self::_install_extension_planner`] so the planner hooks can run
+    /// against the final chains.
+    ///
+    /// Codecs must arrive as objects exposing the capsule getter, never as
+    /// bare capsules — see [`resolve_bundle_codec_id`].
+    pub fn _install_extension_codecs<'py>(
+        slf: &Bound<'py, Self>,
+        logical_codecs: Vec<Bound<'py, PyAny>>,
+        physical_codecs: Vec<Bound<'py, PyAny>>,
+    ) -> PyDataFusionResult<Self> {
+        // Chains are built as local values, so a codec that fails to import --
+        // or that collides with an id already installed -- leaves the session
+        // untouched. Nothing is borrowed across a call back into Python.
+        let (mut logical_codec, mut physical_codec) = {
+            let this = slf.borrow();
+            (
+                this.logical_codec.as_ref().clone(),
+                this.physical_codec.as_ref().clone(),
+            )
+        };
+
+        for codec in logical_codecs {
+            let id = resolve_bundle_codec_id(
+                &codec,
+                "__datafusion_logical_extension_codec__",
+                &logical_codec.codec_ids(),
+            )?;
+            let inner_ffi = ffi_logical_codec_from_pycapsule(codec, Some(slf.as_any()))?;
+            let inner: Arc<dyn LogicalExtensionCodec> = (&inner_ffi).into();
+            logical_codec = logical_codec.with_additional_codec(id, inner);
+        }
+        let logical_codec = Arc::new(logical_codec);
+
+        for codec in physical_codecs {
+            let id = resolve_bundle_codec_id(
+                &codec,
+                "__datafusion_physical_extension_codec__",
+                &physical_codec.codec_ids(),
+            )?;
+            let inner_ffi = ffi_physical_codec_from_pycapsule(codec, Some(slf.as_any()))?;
+            let inner: Arc<dyn PhysicalExtensionCodec> = (&inner_ffi).into();
+            physical_codec = physical_codec.with_additional_codec(id, inner);
+        }
+        let physical_codec = Arc::new(physical_codec);
+
+        Ok(Self {
+            ctx: Arc::clone(&slf.borrow().ctx),
+            logical_codec,
+            physical_codec,
+        })
+    }
+
+    /// Re-export a planner a `__datafusion_session_planner__` hook returned as
+    /// a capsule, so the next hook in the chain receives one either way.
+    ///
+    /// A hook may hand back an object exposing `__datafusion_query_planner__`
+    /// or a raw capsule; the next hook wraps whatever it is given and should
+    /// not have to branch on which. Importing here also surfaces a malformed
+    /// planner at the hook that produced it rather than at the final install.
+    /// Writes nothing.
+    pub fn _export_query_planner<'py>(
+        slf: &Bound<'py, Self>,
+        planner: Bound<'py, PyAny>,
+    ) -> PyDataFusionResult<Bound<'py, PyCapsule>> {
+        let ffi = ffi_query_planner_from_pycapsule(&planner, Some(slf.as_any()))?;
+        Ok(create_query_planner_capsule(slf.py(), &ffi)?)
+    }
+
+    /// Commit the query planner for a `with_extensions` call.
+    ///
+    /// The second phase, run once every codec is installed and every planner
+    /// hook has returned, so the planner is bound against the final chains.
+    /// This is the one call in `with_extensions` that writes to the session,
+    /// and it goes through this context's own `state_ref()`, so providers
+    /// bound to it stay valid.
+    ///
+    /// `None` means no bundle supplied a planner. That still rebuilds
+    /// whichever planner the session already holds against the new chains,
+    /// exactly as `with_logical_extension_codec` does, and writes nothing at
+    /// all if the session has no FFI planner to rebuild.
+    ///
+    /// The caller skips this step entirely when the call installed no codec
+    /// and no planner, the same way [`Self::with_python_udf_inlining`] returns
+    /// early for a no-op toggle: there is nothing to rebind against, and the
+    /// rebuild would drag a planner sitting on another handle's codecs onto
+    /// this one's.
+    #[pyo3(signature = (planner=None))]
+    pub fn _install_extension_planner<'py>(
+        slf: &Bound<'py, Self>,
+        planner: Option<Bound<'py, PyAny>>,
+    ) -> PyDataFusionResult<()> {
+        let planner = planner
+            .map(|planner| ffi_query_planner_from_pycapsule(&planner, Some(slf.as_any())))
+            .transpose()?;
+        slf.borrow().set_session_query_planner(planner);
+        Ok(())
+    }
+}
+
+impl PySessionContext {
+    /// Write the session's query planner, in place.
+    ///
+    /// Pass `Some(planner)` to install one, or `None` to rebuild whichever
+    /// foreign planner is already installed against this context's current
+    /// codecs. A foreign planner carries the FFI codecs it encodes and decodes
+    /// with, so replacing a codec means handing the planner new ones. A planner
+    /// this library owns carries no codecs and needs neither.
+    ///
+    /// This mutates `SessionState` through `state_ref()` rather than deriving a
+    /// new `SessionContext`, and that is the whole point. Every codec handed to
+    /// a foreign object carries an `FFI_TaskContextProvider`, which holds its
+    /// provider *weakly* and upgrades it on each callback — a registered
+    /// catalog provider does so on every `supports_filters_pushdown` and every
+    /// `scan`. Those handles are bound to one `Arc<SessionContext>` allocation.
+    /// Deriving a replacement would orphan every handle bound to the old one
+    /// and leave callbacks failing with `TaskContextProvider went out of scope
+    /// over FFI boundary`, and only the codecs this struct happens to hold
+    /// could be moved across; one already embedded in a registered
+    /// `FFI_CatalogProvider` is unreachable. Keeping the single allocation for
+    /// the life of the session avoids the problem rather than repairing it.
+    fn set_session_query_planner(&self, planner: Option<FFI_QueryPlanner>) {
+        let planner = planner.or_else(|| {
+            let state = self.ctx.state();
+            let installed: &dyn std::any::Any = state.query_planner().as_ref();
+            installed
+                .downcast_ref::<ForeignQueryPlanner>()
+                .map(|planner| planner.0.clone())
+        });
+        let Some(planner) = planner else {
+            return;
+        };
+
+        let inner: Arc<dyn QueryPlanner + Send + Sync> = (&planner).into();
+        let planner: Arc<dyn QueryPlanner + Send + Sync> = (&FFI_QueryPlanner::new_with_ffi_codecs(
+            inner,
+            Self::ffi_logical_codec_for(&self.ctx, &self.logical_codec),
+            Self::ffi_physical_codec_for(&self.ctx, &self.physical_codec),
+        ))
+            .into();
+
+        let state_ref = self.ctx.state_ref();
+        let mut guard = state_ref.write();
+        // `with_session_id` is load-bearing, not redundant.
+        // `SessionStateBuilder::new_from_existing` drops the id and `build`
+        // mints a fresh one, while `SessionContext` cached the original in a
+        // field of its own. Without this the session would report one id from
+        // `session_id()` and another from every `TaskContext` it hands out.
+        // Same reason `add_physical_optimizer_rule` carries it over.
+        *guard = SessionStateBuilder::new_from_existing(guard.clone())
+            .with_session_id(guard.session_id().to_string())
+            .with_query_planner(planner)
+            .build();
+    }
+
+    async fn _table(&self, name: &str) -> datafusion::common::Result<DataFrame> {
+        self.ctx.table(name).await
+    }
+
+    async fn register_csv_from_multiple_paths(
+        &self,
+        name: &str,
+        table_paths: Vec<String>,
+        options: CsvReadOptions<'_>,
+    ) -> datafusion::common::Result<()> {
+        let table_paths = table_paths.to_urls()?;
+        let session_config = self.ctx.copied_config();
+        let listing_options =
+            options.to_listing_options(&session_config, self.ctx.copied_table_options());
+
+        let option_extension = listing_options.file_extension.clone();
+
+        if table_paths.is_empty() {
+            return exec_err!("No table paths were provided");
+        }
+
+        // check if the file extension matches the expected extension
+        for path in &table_paths {
+            let file_path = path.as_str();
+            if !file_path.ends_with(option_extension.as_str()) && !path.is_collection() {
+                return exec_err!(
+                    "File path '{file_path}' does not match the expected extension '{option_extension}'"
+                );
+            }
+        }
+
+        let resolved_schema = options
+            .get_resolved_schema(&session_config, self.ctx.state(), table_paths[0].clone())
+            .await?;
+
+        let config = ListingTableConfig::new_with_multi_paths(table_paths)
+            .with_listing_options(listing_options)
+            .with_schema(resolved_schema);
+        let table = ListingTable::try_new(config)?;
+        self.ctx
+            .register_table(TableReference::Bare { table: name.into() }, Arc::new(table))?;
+        Ok(())
+    }
+
+    /// Session-scoped logical codec. Sibling modules read this when they
+    /// need to serialize/deserialize logical-layer types (LogicalPlan,
+    /// Expr) against the user-installed (or default) codec stack.
+    pub(crate) fn logical_codec(&self) -> &Arc<PythonLogicalCodec> {
+        &self.logical_codec
+    }
+
+    /// Session-scoped physical codec. Sibling modules read this for
+    /// ExecutionPlan / PhysicalExpr serialization.
+    pub(crate) fn physical_codec(&self) -> &Arc<PythonPhysicalCodec> {
+        &self.physical_codec
+    }
+
+    /// Build an FFI-wrapped clone of the session's logical codec on demand.
+    /// Used at every site that exports the codec across an FFI boundary
+    /// (capsule getters, Rust wrappers for Python-defined providers, etc.).
+    pub(crate) fn ffi_logical_codec(&self) -> Arc<FFI_LogicalExtensionCodec> {
+        Arc::new(Self::ffi_logical_codec_for(&self.ctx, &self.logical_codec))
+    }
+
+    fn ffi_logical_codec_for(
+        ctx: &Arc<SessionContext>,
+        codec: &Arc<PythonLogicalCodec>,
+    ) -> FFI_LogicalExtensionCodec {
+        let codec: Arc<dyn LogicalExtensionCodec> =
+            Arc::clone(codec) as Arc<dyn LogicalExtensionCodec>;
+        let runtime = get_tokio_runtime().handle().clone();
+        let ctx_provider = Arc::clone(ctx) as Arc<dyn TaskContextProvider>;
+        FFI_LogicalExtensionCodec::new(codec, Some(runtime), &ctx_provider)
+    }
+
+    fn ffi_physical_codec_for(
+        ctx: &Arc<SessionContext>,
+        codec: &Arc<PythonPhysicalCodec>,
+    ) -> FFI_PhysicalExtensionCodec {
+        let codec: Arc<dyn PhysicalExtensionCodec + Send> =
+            Arc::clone(codec) as Arc<dyn PhysicalExtensionCodec + Send>;
+        let runtime = get_tokio_runtime().handle().clone();
+        let ctx_provider = Arc::clone(ctx) as Arc<dyn TaskContextProvider>;
+        FFI_PhysicalExtensionCodec::new(codec, Some(runtime), &ctx_provider)
+    }
+
+    /// Build an FFI-wrapped clone of the session's physical codec on demand.
+    pub(crate) fn ffi_physical_codec(&self) -> Arc<FFI_PhysicalExtensionCodec> {
+        Arc::new(Self::ffi_physical_codec_for(
+            &self.ctx,
+            &self.physical_codec,
+        ))
+    }
+}
+
+/// Determine the wire identity to tag an installed codec's payloads with.
+///
+/// Every payload a chained codec writes carries this string, and decoding
+/// dispatches on it, so it has to name the same codec in the process that
+/// decodes as it did in the process that encoded. Resolution order:
+///
+/// 1. An explicit `codec_id` argument.
+/// 2. `codec.__datafusion_codec_id__`, letting a library pin its own identity
+///    so a class rename does not invalidate previously encoded plans, and so
+///    two instances of one class can own disjoint slices of the wire format.
+///    `SessionContext` pins its own through this arm — see
+///    [`PySessionContext::__datafusion_codec_id__`] — because the class-derived
+///    id below would name every session at once.
+/// 3. The exporting object's `module.QualName`, which is the library's own
+///    import path and therefore already stable across processes. This is the
+///    common case and asks nothing of existing extension libraries.
+/// 4. For a bare `PyCapsule` there is nothing stable to read — every capsule
+///    reports the same type — so mint a fresh random id. Payloads tagged this
+///    way decode correctly within the session lineage that installed the
+///    codec, because the chain is cloned along with the id, and fail with a
+///    pointed error everywhere else. Randomness is the point: an id drawn from
+///    a namespace another session can mint the same value from — a counter, a
+///    chain position — would let an unrelated codec answer for these bytes.
+///    Reachable only from `with_logical_extension_codec` and
+///    `with_physical_extension_codec`, where `codec_id=` is the way out;
+///    `with_extensions` refuses bare capsules outright rather than naming them
+///    after something that is not the codec. See [`resolve_bundle_codec_id`].
+///
+/// An id already in use is rejected rather than shadowed. Two codecs sharing an
+/// id are indistinguishable on decode, and the API cannot tell whether two
+/// instances of one class write the same wire format — so the ambiguity is
+/// surfaced at install time, where the caller can resolve it, instead of at
+/// decode time, where it would pick whichever entry came first.
+fn resolve_codec_id(
+    codec: &Bound<'_, PyAny>,
+    explicit: Option<String>,
+    existing: &[&str],
+) -> PyResult<String> {
+    let id = derive_codec_id(codec, explicit)?;
+    if existing.contains(&id.as_str()) {
+        return Err(PyValueError::new_err(format!(
+            "An extension codec with id '{id}' is already installed on this session. Two \
+             codecs cannot share an id, because a payload names its codec by id when it is \
+             decoded. Give this one a distinct identity: declare \
+             `__datafusion_codec_id__` on the object being installed, or pass `codec_id=` \
+             if you are calling `with_logical_extension_codec` or \
+             `with_physical_extension_codec` directly."
+        )));
+    }
+    Ok(id)
+}
+
+/// Resolve the wire id for a codec contributed through `with_extensions`,
+/// requiring an object that can name itself.
+///
+/// `with_extensions` takes no `codec_id=`, so the only naming channels are the
+/// ones [`derive_codec_id`] reads off the handed-over object: a declared
+/// `__datafusion_codec_id__`, or its class's `module.QualName`. A bare capsule
+/// has neither. Naming it after the bundle that contributed it looks like an
+/// answer and is not one: the bundle is whatever object the caller passed to
+/// `with_extensions`, so a bundle that wraps another library's bundle — the
+/// natural way for an application to package several libraries as one — would
+/// stamp its own identity onto the inner library's codecs and silently change
+/// the wire format. The inner library cannot defend against that no matter what
+/// it declares, and the mismatch does not surface until a plan fails to decode
+/// in another process.
+///
+/// So the capsule is refused here, where the author can fix it by wrapping it
+/// in an object. Wrapping also decouples the codec's wire identity from the
+/// bundle's Python class name, which is the whole point of
+/// `__datafusion_codec_id__`.
+fn resolve_bundle_codec_id(
+    codec: &Bound<'_, PyAny>,
+    getter: &str,
+    existing: &[&str],
+) -> PyResult<String> {
+    if codec.is_instance_of::<PyCapsule>() {
+        return Err(PyTypeError::new_err(format!(
+            "A codec contributed through `with_extensions` must be an object exposing \
+             `{getter}`, not a bare PyCapsule. A capsule carries no type of its own, so \
+             there is nothing to name the codec by, and a payload names its codec by id \
+             when it is decoded — an id that has to mean the same thing in whichever \
+             process decodes. Wrap the capsule in an object that exposes `{getter}` and, \
+             if the class name is not the identity you want on the wire, declares \
+             `__datafusion_codec_id__`."
+        )));
+    }
+    resolve_codec_id(codec, None, existing)
+}
+
+fn derive_codec_id(codec: &Bound<'_, PyAny>, explicit: Option<String>) -> PyResult<String> {
+    if let Some(id) = explicit {
+        return Ok(id);
+    }
+    if let Ok(declared) = codec.getattr("__datafusion_codec_id__")
+        && !declared.is_none()
+    {
+        return declared.extract::<String>();
+    }
+    if codec.is_instance_of::<PyCapsule>() {
+        return Ok(format!(
+            "{ANONYMOUS_CODEC_ID_PREFIX}{}",
+            Uuid::new_v4()
+                .simple()
+                .encode_lower(&mut Uuid::encode_buffer())
+        ));
+    }
+    let ty = codec.get_type();
+    let module = ty
+        .getattr("__module__")
+        .and_then(|m| m.extract::<String>())
+        .unwrap_or_else(|_| "<unknown>".to_string());
+    let qualname = ty
+        .getattr("__qualname__")
+        .and_then(|q| q.extract::<String>())
+        .or_else(|_| ty.name().and_then(|n| n.extract::<String>()))?;
+    Ok(format!("{module}.{qualname}"))
+}
+
+pub fn parse_file_compression_type(
+    file_compression_type: Option<String>,
+) -> Result<FileCompressionType, PyErr> {
+    FileCompressionType::from_str(&file_compression_type.unwrap_or_default()).map_err(|_| {
+        PyValueError::new_err("file_compression_type must be one of: gzip, bz2, xz, zstd")
+    })
+}
+
+fn path_to_str(path: &Path) -> PyDataFusionResult<&str> {
+    path.to_str()
+        .ok_or_else(|| PyValueError::new_err("Unable to convert path to a string").into())
+}
+
+fn convert_csv_options(
+    options: Option<&PyCsvReadOptions>,
+) -> PyDataFusionResult<CsvReadOptions<'_>> {
+    Ok(options
+        .map(|opts| opts.try_into())
+        .transpose()?
+        .unwrap_or_default())
+}
+
+fn convert_partition_cols(
+    table_partition_cols: Vec<(String, PyArrowType<DataType>)>,
+) -> Vec<(String, DataType)> {
+    table_partition_cols
+        .into_iter()
+        .map(|(name, ty)| (name, ty.0))
+        .collect()
+}
+
+fn convert_file_sort_order(
+    file_sort_order: Option<Vec<Vec<PySortExpr>>>,
+) -> Vec<Vec<datafusion::logical_expr::SortExpr>> {
+    file_sort_order
+        .unwrap_or_default()
+        .into_iter()
+        .map(|e| e.into_iter().map(|f| f.into()).collect())
+        .collect()
+}
+
+fn build_parquet_options<'a>(
+    table_partition_cols: Vec<(String, PyArrowType<DataType>)>,
+    parquet_pruning: bool,
+    file_extension: &'a str,
+    skip_metadata: bool,
+    schema: &'a Option<PyArrowType<Schema>>,
+    file_sort_order: Option<Vec<Vec<PySortExpr>>>,
+) -> ParquetReadOptions<'a> {
+    let mut options = ParquetReadOptions::default()
+        .table_partition_cols(convert_partition_cols(table_partition_cols))
+        .parquet_pruning(parquet_pruning)
+        .skip_metadata(skip_metadata);
+    options.file_extension = file_extension;
+    options.schema = schema.as_ref().map(|x| &x.0);
+    options.file_sort_order = convert_file_sort_order(file_sort_order);
+    options
+}
+
+fn build_json_options<'a>(
+    table_partition_cols: Vec<(String, PyArrowType<DataType>)>,
+    file_compression_type: Option<String>,
+    schema_infer_max_records: usize,
+    file_extension: &'a str,
+    schema: &'a Option<PyArrowType<Schema>>,
+) -> Result<JsonReadOptions<'a>, PyErr> {
+    let mut options = JsonReadOptions::default()
+        .table_partition_cols(convert_partition_cols(table_partition_cols))
+        .file_compression_type(parse_file_compression_type(file_compression_type)?);
+    options.schema_infer_max_records = schema_infer_max_records;
+    options.file_extension = file_extension;
+    options.schema = schema.as_ref().map(|x| &x.0);
+    Ok(options)
+}
+
+fn build_arrow_options<'a>(
+    table_partition_cols: Vec<(String, PyArrowType<DataType>)>,
+    file_extension: &'a str,
+    schema: &'a Option<PyArrowType<Schema>>,
+) -> ArrowReadOptions<'a> {
+    let mut options = ArrowReadOptions::default()
+        .table_partition_cols(convert_partition_cols(table_partition_cols));
+    options.file_extension = file_extension;
+    options.schema = schema.as_ref().map(|x| &x.0);
+    options
+}
+
+fn build_avro_options<'a>(
+    table_partition_cols: Vec<(String, PyArrowType<DataType>)>,
+    file_extension: &'a str,
+    schema: &'a Option<PyArrowType<Schema>>,
+) -> AvroReadOptions<'a> {
+    let mut options = AvroReadOptions::default()
+        .table_partition_cols(convert_partition_cols(table_partition_cols));
+    options.file_extension = file_extension;
+    options.schema = schema.as_ref().map(|x| &x.0);
+    options
+}
+
+impl From<PySessionContext> for SessionContext {
+    fn from(ctx: PySessionContext) -> SessionContext {
+        ctx.ctx.as_ref().clone()
+    }
+}
+
+impl From<SessionContext> for PySessionContext {
+    fn from(ctx: SessionContext) -> PySessionContext {
+        PySessionContext {
+            ctx: Arc::new(ctx),
+            logical_codec: Arc::new(PythonLogicalCodec::default()),
+            physical_codec: Arc::new(PythonPhysicalCodec::default()),
+        }
+    }
+}

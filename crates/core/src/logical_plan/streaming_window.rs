@@ -1,5 +1,6 @@
 use core::fmt::Debug;
 
+use std::cmp::Ordering;
 use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
@@ -22,6 +23,12 @@ pub struct StreamingWindowPlanNode {
 impl Debug for StreamingWindowPlanNode {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         UserDefinedLogicalNodeCore::fmt_for_explain(self, f)
+    }
+}
+
+impl PartialOrd for StreamingWindowPlanNode {
+    fn partial_cmp(&self, _other: &Self) -> Option<Ordering> {
+        Some(Ordering::Equal)
     }
 }
 

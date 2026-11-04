@@ -64,7 +64,7 @@ pub struct GroupedWindowAggStream {
     pub schema: SchemaRef,
     input: SendableRecordBatchStream,
     baseline_metrics: BaselineMetrics,
-    exec_aggregate_expressions: Vec<AggregateFunctionExpr>,
+    exec_aggregate_expressions: Vec<Arc<AggregateFunctionExpr>>,
     aggregate_expressions: Vec<Vec<Arc<dyn PhysicalExpr>>>,
     filter_expressions: Vec<Option<Arc<dyn PhysicalExpr>>>,
     latest_watermark: Arc<Mutex<Option<SystemTime>>>,
@@ -135,7 +135,9 @@ impl GroupedWindowAggStream {
             AggregateMode::Partial | AggregateMode::Single | AggregateMode::SinglePartitioned => {
                 agg_filter_expr
             }
-            AggregateMode::Final | AggregateMode::FinalPartitioned => {
+            AggregateMode::Final
+            | AggregateMode::FinalPartitioned
+            | AggregateMode::PartialReduce => {
                 vec![None; exec_operator.aggregate_expressions.len()]
             }
         };
@@ -249,7 +251,7 @@ impl GroupedWindowAggStream {
             }
         }
         concat_batches(&self.output_schema_with_window(), &results)
-            .map_err(|err| DataFusionError::ArrowError(err, None))
+            .map_err(|err| DataFusionError::ArrowError(Box::new(err), None))
     }
 
     fn process_watermark(&mut self, watermark: RecordBatchWatermark) {
@@ -282,7 +284,7 @@ impl GroupedWindowAggStream {
                 let accumulators: Vec<_> = self
                     .exec_aggregate_expressions
                     .iter()
-                    .map(|i| create_group_accumulator(&Arc::new(i.to_owned())))
+                    .map(|i| create_group_accumulator(i))
                     .collect::<Result<_>>()?;
                 let elapsed = start_time.elapsed().unwrap().as_millis();
                 let name = format!("GroupedHashAggregateStream WindowStart[{elapsed}]");
@@ -290,7 +292,8 @@ impl GroupedWindowAggStream {
                 let reservation = MemoryConsumer::new(name)
                     .with_can_spill(false)
                     .register(self.context.memory_pool());
-                let group_values = new_group_values(self.group_schema.clone())?;
+                let group_values =
+                    new_group_values(self.group_schema.clone(), &GroupOrdering::None)?;
 
                 GroupedAggWindowFrame::new(
                     *start_time,
@@ -640,7 +643,6 @@ impl GroupedAggWindowFrame {
                 acc.merge_batch(
                     &checkpointed_acc.states.arrays,
                     &group_indices,
-                    None,
                     checkpointed_acc.num_groups,
                 )
                 .unwrap();

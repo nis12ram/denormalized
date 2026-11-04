@@ -1,10 +1,11 @@
 use async_trait::async_trait;
-use std::{any::Any, sync::Arc};
+use std::sync::Arc;
 
 use arrow_schema::{Schema, SchemaRef, SortOptions};
 use datafusion::catalog::Session;
 use datafusion::common::{not_impl_err, plan_err, Result};
 use datafusion::datasource::TableProvider;
+use datafusion::logical_expr::dml::InsertOp;
 use datafusion::logical_expr::{Expr, SortExpr, TableType};
 use datafusion::physical_expr::{expressions, LexOrdering, PhysicalSortExpr};
 use datafusion::physical_plan::ExecutionPlan;
@@ -14,6 +15,7 @@ use crate::physical_plan::stream_table::DenormalizedStreamingTableExec;
 use super::{KafkaReadConfig, KafkaStreamRead};
 
 // Used to createa kafka source
+#[derive(Debug)]
 pub struct TopicReader(pub Arc<KafkaReadConfig>);
 
 impl TopicReader {
@@ -57,10 +59,6 @@ impl TopicReader {
 
 #[async_trait]
 impl TableProvider for TopicReader {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.0.schema.clone()
     }
@@ -83,7 +81,7 @@ impl TableProvider for TopicReader {
         &self,
         _state: &dyn Session,
         _input: Arc<dyn ExecutionPlan>,
-        _overwrite: bool,
+        _insert_op: InsertOp,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         return not_impl_err!("Writing not implemented for TopicReader please use TopicWriter");
     }
@@ -118,8 +116,8 @@ fn create_ordering(schema: &Schema, sort_order: &[Vec<SortExpr>]) -> Result<Vec<
                 }
             }
         }
-        if !sort_exprs.is_empty() {
-            all_sort_orders.push(sort_exprs);
+        if let Some(ordering) = LexOrdering::new(sort_exprs) {
+            all_sort_orders.push(ordering);
         }
     }
     Ok(all_sort_orders)

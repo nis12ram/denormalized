@@ -288,6 +288,7 @@ pub fn scalar_to_json(value: &ScalarValue) -> serde_json::Value {
         ScalarValue::Map(_) => todo!(),
         ScalarValue::Union(_, _, _) => todo!(),
         ScalarValue::Dictionary(_, _) => todo!(),
+        _ => todo!(),
     }
 }
 

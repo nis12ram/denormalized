@@ -2,8 +2,9 @@ use async_trait::async_trait;
 use itertools::multiunzip;
 use std::sync::Arc;
 
+use datafusion::catalog::Session;
 use datafusion::common::{internal_err, DFSchema};
-use datafusion::execution::context::SessionState;
+use datafusion::logical_expr::physical_planning_context::PhysicalPlanningContext;
 use datafusion::logical_expr::Expr;
 use datafusion::logical_expr::{LogicalPlan, UserDefinedLogicalNode};
 use datafusion::physical_expr::create_physical_expr;
@@ -11,6 +12,7 @@ use datafusion::physical_plan::{
     aggregates::{AggregateMode, PhysicalGroupBy},
     ExecutionPlan,
 };
+#[allow(deprecated)]
 use datafusion::physical_planner::{
     create_aggregate_expr_and_maybe_filter, ExtensionPlanner, PhysicalPlanner,
 };
@@ -36,13 +38,19 @@ fn tuple_err<T, R>(value: (Result<T>, Result<R>)) -> Result<(T, R)> {
 fn create_grouping_physical_expr(
     group_expr: &[Expr],
     input_dfschema: &DFSchema,
-    session_state: &SessionState,
+    session: &dyn Session,
+    planning_ctx: &PhysicalPlanningContext,
 ) -> Result<PhysicalGroupBy> {
     if group_expr.len() == 1 {
         let expr = &group_expr[0];
         match expr {
             Expr::Column(c) => Ok(PhysicalGroupBy::new_single(vec![tuple_err((
-                create_physical_expr(expr, input_dfschema, session_state.execution_props()),
+                create_physical_expr(
+                    expr,
+                    input_dfschema,
+                    session.execution_props(),
+                    planning_ctx,
+                ),
                 Ok(c.name.clone()),
             ))?])),
             _ => internal_err!("Expected a column expression in GROUP BY for Streaming Window"),
@@ -53,7 +61,12 @@ fn create_grouping_physical_expr(
                 .iter()
                 .map(|e| match e {
                     Expr::Column(c) => tuple_err((
-                        create_physical_expr(e, input_dfschema, session_state.execution_props()),
+                        create_physical_expr(
+                            e,
+                            input_dfschema,
+                            session.execution_props(),
+                            planning_ctx,
+                        ),
                         Ok(c.flat_name()),
                     )),
                     _ => internal_err!(
@@ -65,6 +78,7 @@ fn create_grouping_physical_expr(
     }
 }
 
+#[allow(deprecated)]
 #[async_trait]
 impl ExtensionPlanner for StreamingWindowPlanner {
     /// Create a physical plan for an extension node
@@ -74,7 +88,8 @@ impl ExtensionPlanner for StreamingWindowPlanner {
         node: &dyn UserDefinedLogicalNode,
         logical_inputs: &[&LogicalPlan],
         physical_inputs: &[Arc<dyn ExecutionPlan>],
-        _session_state: &SessionState,
+        session: &dyn Session,
+        planning_ctx: &PhysicalPlanningContext,
     ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
         assert_eq!(
             logical_inputs.len(),
@@ -101,7 +116,8 @@ impl ExtensionPlanner for StreamingWindowPlanner {
                 let groups = create_grouping_physical_expr(
                     streaming_window_node.aggregrate.group_expr.as_ref(),
                     logical_input_schema,
-                    _session_state,
+                    session,
+                    planning_ctx,
                 )?;
 
                 let agg_filter = streaming_window_node
@@ -113,7 +129,7 @@ impl ExtensionPlanner for StreamingWindowPlanner {
                             e,
                             logical_input_schema,
                             &physical_input_schema,
-                            _session_state.execution_props(),
+                            session.execution_props(),
                         )
                     })
                     .collect::<Result<Vec<_>>>()?;

@@ -1,0 +1,231 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+use std::sync::Arc;
+
+use datafusion::physical_expr::Partitioning;
+use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties, displayable};
+use datafusion_proto::physical_plan::AsExecutionPlan;
+use prost::Message;
+use pyo3::exceptions::PyRuntimeError;
+use pyo3::prelude::*;
+use pyo3::types::PyBytes;
+
+use crate::codec::PythonPhysicalCodec;
+use crate::context::PySessionContext;
+use crate::errors::PyDataFusionResult;
+use crate::metrics::PyMetricsSet;
+
+#[pyclass(
+    from_py_object,
+    frozen,
+    name = "ExecutionPlan",
+    module = "datafusion",
+    subclass
+)]
+#[derive(Debug, Clone)]
+pub struct PyExecutionPlan {
+    pub plan: Arc<dyn ExecutionPlan>,
+}
+
+impl PyExecutionPlan {
+    /// creates a new PyPhysicalPlan
+    pub fn new(plan: Arc<dyn ExecutionPlan>) -> Self {
+        Self { plan }
+    }
+}
+
+#[pymethods]
+impl PyExecutionPlan {
+    /// Get the inputs to this plan
+    pub fn children(&self) -> Vec<PyExecutionPlan> {
+        self.plan
+            .children()
+            .iter()
+            .map(|&p| p.to_owned().into())
+            .collect()
+    }
+
+    pub fn display(&self) -> String {
+        let d = displayable(self.plan.as_ref());
+        format!("{}", d.one_line())
+    }
+
+    pub fn display_indent(&self) -> String {
+        let d = displayable(self.plan.as_ref());
+        format!("{}", d.indent(false))
+    }
+
+    #[pyo3(signature = (ctx=None))]
+    pub fn to_bytes<'py>(
+        &'py self,
+        py: Python<'py>,
+        ctx: Option<PySessionContext>,
+    ) -> PyDataFusionResult<Bound<'py, PyBytes>> {
+        // Route through the session's physical codec when supplied so
+        // user FFI codecs registered via
+        // `with_physical_extension_codec` see the encode path.
+        let default_codec;
+        let codec: &dyn datafusion_proto::physical_plan::PhysicalExtensionCodec = match ctx {
+            Some(ref ctx) => ctx.physical_codec().as_ref(),
+            None => {
+                default_codec = PythonPhysicalCodec::default();
+                &default_codec
+            }
+        };
+        let proto = datafusion_proto::protobuf::PhysicalPlanNode::try_from_physical_plan(
+            self.plan.clone(),
+            codec,
+        )?;
+
+        let bytes = proto.encode_to_vec();
+        Ok(PyBytes::new(py, &bytes))
+    }
+
+    #[staticmethod]
+    pub fn from_bytes(
+        ctx: PySessionContext,
+        proto_msg: Bound<'_, PyBytes>,
+    ) -> PyDataFusionResult<Self> {
+        let bytes: &[u8] = proto_msg.extract().map_err(Into::<PyErr>::into)?;
+        let proto_plan =
+            datafusion_proto::protobuf::PhysicalPlanNode::decode(bytes).map_err(|e| {
+                PyRuntimeError::new_err(format!(
+                    "Unable to decode physical node from serialized bytes: {e}"
+                ))
+            })?;
+
+        let codec = ctx.physical_codec();
+        let plan =
+            proto_plan.try_into_physical_plan(ctx.ctx.task_ctx().as_ref(), codec.as_ref())?;
+        Ok(Self::new(plan))
+    }
+
+    pub fn metrics(&self) -> Option<PyMetricsSet> {
+        self.plan.metrics().map(PyMetricsSet::new)
+    }
+
+    fn __repr__(&self) -> String {
+        self.display_indent()
+    }
+
+    #[getter]
+    pub fn partition_count(&self) -> usize {
+        self.plan.output_partitioning().partition_count()
+    }
+
+    #[getter]
+    pub fn output_partitioning(&self) -> PyPhysicalPartitioning {
+        self.plan.output_partitioning().clone().into()
+    }
+}
+
+/// How a physical plan's output rows are spread across its partitions.
+///
+/// Distinct from `datafusion.expr.Partitioning`, the *logical* partitioning
+/// recorded on a `Repartition` node and read back with
+/// `Repartition.partitioning_scheme()`. Neither is an argument to anything:
+/// `DataFrame.repartition` takes a count and `repartition_by_hash` takes
+/// expressions and a count. The logical one records the request; this one
+/// reports what the built plan does with it, and they disagree whenever the
+/// optimizer rewrites or drops the repartition. The two Rust enums differ
+/// too -- the logical one has `DistributeBy` and no `UnknownPartitioning`.
+// `skip_from_py_object` because this is a read-only report: nothing accepts a
+// partitioning as an argument, so there is no inbound direction to support.
+// Rust callers that need the `Partitioning` read it off the plan instead.
+#[pyclass(
+    skip_from_py_object,
+    frozen,
+    name = "PhysicalPartitioning",
+    module = "datafusion",
+    subclass
+)]
+#[derive(Debug, Clone)]
+pub struct PyPhysicalPartitioning {
+    partitioning: Partitioning,
+}
+
+#[pymethods]
+impl PyPhysicalPartitioning {
+    /// Which partitioning scheme this is.
+    ///
+    /// `UnknownPartitioning` is what a plan reports when it knows how many
+    /// partitions it has but nothing about how rows are distributed between
+    /// them, which is the common case for a file scan. `RoundRobinBatch` and
+    /// `Hash` come from a `RepartitionExec`.
+    ///
+    /// `Range` is implemented upstream and reaches this getter, but never from
+    /// a plan this package built: `DataFrame.repartition` requests round-robin,
+    /// `repartition_by_hash` requests hash, and SQL has no range-repartition
+    /// syntax. It arrives on a plan built elsewhere -- decoded by
+    /// `ExecutionPlan.from_bytes`, or returned by an extension library's query
+    /// planner -- since `datafusion-proto` and `datafusion-ffi` both carry
+    /// `Partitioning::Range` faithfully.
+    #[getter]
+    pub fn scheme(&self) -> &'static str {
+        match self.partitioning {
+            Partitioning::RoundRobinBatch(_) => "RoundRobinBatch",
+            Partitioning::Hash(_, _) => "Hash",
+            Partitioning::Range(_) => "Range",
+            Partitioning::UnknownPartitioning(_) => "UnknownPartitioning",
+        }
+    }
+
+    #[getter]
+    pub fn partition_count(&self) -> usize {
+        self.partitioning.partition_count()
+    }
+
+    /// The expressions rows are hashed on, or `None` for other schemes.
+    ///
+    /// These are physical expressions, which have no Python representation, so
+    /// they are returned in their displayed form.
+    ///
+    /// `None` for `Range` too, whose ordering and split points this class does
+    /// not expose yet.
+    #[getter]
+    pub fn hash_expressions(&self) -> Option<Vec<String>> {
+        match &self.partitioning {
+            Partitioning::Hash(exprs, _) => {
+                Some(exprs.iter().map(|expr| format!("{expr}")).collect())
+            }
+            _ => None,
+        }
+    }
+
+    fn __repr__(&self) -> String {
+        format!("{}", self.partitioning)
+    }
+}
+
+impl From<Partitioning> for PyPhysicalPartitioning {
+    fn from(partitioning: Partitioning) -> Self {
+        Self { partitioning }
+    }
+}
+
+impl From<PyExecutionPlan> for Arc<dyn ExecutionPlan> {
+    fn from(plan: PyExecutionPlan) -> Arc<dyn ExecutionPlan> {
+        plan.plan.clone()
+    }
+}
+
+impl From<Arc<dyn ExecutionPlan>> for PyExecutionPlan {
+    fn from(plan: Arc<dyn ExecutionPlan>) -> PyExecutionPlan {
+        PyExecutionPlan { plan: plan.clone() }
+    }
+}

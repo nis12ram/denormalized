@@ -1,4 +1,3 @@
-use std::any::Any;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -9,7 +8,9 @@ use datafusion::functions_aggregate::expr_fn::{max, min};
 use datafusion::logical_expr::sort_properties::{ExprProperties, SortProperties};
 use datafusion::logical_expr::Volatility;
 use datafusion::logical_expr::{col, lit};
-use datafusion::logical_expr::{ColumnarValue, ScalarUDF, ScalarUDFImpl, Signature};
+use datafusion::logical_expr::{
+    ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature,
+};
 
 use denormalized::datasource::kafka::{ConnectionOpts, KafkaTopicBuilder};
 use denormalized::prelude::*;
@@ -68,7 +69,7 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct SampleUdf {
     signature: Signature,
 }
@@ -82,10 +83,6 @@ impl SampleUdf {
 }
 
 impl ScalarUDFImpl for SampleUdf {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &str {
         "sample_udf"
     }
@@ -98,12 +95,16 @@ impl ScalarUDFImpl for SampleUdf {
         Ok(DataType::Float64)
     }
 
-    fn invoke(&self, args: &[ColumnarValue]) -> datafusion::error::Result<ColumnarValue> {
+    fn invoke_with_args(
+        &self,
+        args: ScalarFunctionArgs,
+    ) -> datafusion::error::Result<ColumnarValue> {
+        let args = args.args;
         assert_eq!(args.len(), 1);
         let value = &args[0];
         assert_eq!(value.data_type(), DataType::Float64);
 
-        let args = ColumnarValue::values_to_arrays(args)?;
+        let args = ColumnarValue::values_to_arrays(&args)?;
         let value = as_float64_array(&args[0]).expect("cast failed");
 
         let array = value
