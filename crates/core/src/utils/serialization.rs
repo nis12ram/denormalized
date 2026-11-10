@@ -549,7 +549,7 @@ mod tests {
         let serialized = serialize_array_container(&array_container).unwrap();
 
         let deserialized = deserialize_array_container(&serialized).unwrap();
-        accumulator = Box::new(AvgAccumulator::default());
+        *accumulator = AvgAccumulator::default();
         let _ = accumulator.merge_batch(&deserialized.arrays);
 
         let result = accumulator.evaluate().unwrap();

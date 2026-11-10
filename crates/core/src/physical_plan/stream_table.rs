@@ -52,7 +52,7 @@ use datafusion::{
 use futures::stream::StreamExt;
 use log::debug;
 
-use crate::datasource::kafka::KafkaStreamRead;
+use crate::connectors::kafka::KafkaStreamRead;
 
 pub trait PartitionStreamExt: PartitionStream {
     fn requires_node_id(&self) -> bool {

@@ -1,7 +1,9 @@
 use std::{
     collections::HashMap,
-    time::{Instant, SystemTime, UNIX_EPOCH},
+    time::{SystemTime, UNIX_EPOCH},
 };
+
+use datafusion::common::instant::Instant;
 
 use crate::channel_manager::{create_channel, get_sender, take_receiver};
 use crossbeam::channel;

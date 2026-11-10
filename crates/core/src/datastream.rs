@@ -16,8 +16,8 @@ use datafusion::logical_expr::{
 use datafusion::physical_plan::display::DisplayableExecutionPlan;
 
 use crate::config_extensions::denormalized_config::DenormalizedConfig;
+use crate::connectors::kafka::{KafkaConnectionOpts, KafkaTopicBuilder};
 use crate::context::Context;
-use crate::datasource::kafka::{ConnectionOpts, KafkaTopicBuilder};
 use crate::logical_plan::StreamingLogicalPlanBuilder;
 use crate::physical_plan::utils::time::TimestampUnit;
 use crate::state_backend::slatedb::get_global_slatedb;
@@ -49,10 +49,10 @@ impl DataStream {
         }
     }
 
-    fn start_shutdown_listener(&self) {
+    fn start_shutdown_listener(&self) -> SpawnedTask<()> {
         let shutdown_tx = self.shutdown_tx.clone();
 
-        tokio::spawn(async move {
+        SpawnedTask::spawn(async move {
             let mut terminate_signal = signal::unix::signal(signal::unix::SignalKind::terminate())
                 .expect("Failed to listen for SIGTERM");
 
@@ -67,7 +67,7 @@ impl DataStream {
                 }
                 shutdown_tx.send(true).unwrap();
             }
-        });
+        })
     }
 
     pub fn select(self, expr_list: Vec<Expr>) -> Result<Self> {
@@ -244,11 +244,11 @@ impl DataStream {
         F: FnOnce(watch::Receiver<bool>) -> Fut,
         Fut: std::future::Future<Output = Result<T>>,
     {
-        self.start_shutdown_listener();
+        let _shutdown_listener = self.start_shutdown_listener();
 
         let config = self.context.session_context.copied_config();
         let config_options = config.options().extensions.get::<DenormalizedConfig>();
-        let should_checkpoint = config_options.map_or(false, |c| c.checkpoint);
+        let should_checkpoint = config_options.is_some_and(|c| c.checkpoint);
 
         let mut maybe_orchestrator_handle = None;
 
@@ -351,7 +351,7 @@ impl DataStream {
                     .with_encoding("json")?
                     .with_topic(topic.clone())
                     .with_schema(processed_schema)
-                    .build_writer(ConnectionOpts::new())
+                    .build_writer(KafkaConnectionOpts::new())
                     .await?;
 
                 self.context

@@ -7,18 +7,29 @@ use datafusion::execution::{
 };
 
 use crate::config_extensions::denormalized_config::DenormalizedConfig;
-use crate::datasource::kafka::TopicReader;
+use crate::connectors::kafka::TopicReader;
+use crate::connectors::ConnectorRegistry;
 use crate::datastream::DataStream;
 use crate::physical_optimizer::EnsureHashPartititionOnGroupByForStreamingAggregates;
 use crate::query_planner::StreamingQueryPlanner;
+use crate::sql::execute_sql;
 use crate::state_backend::slatedb::initialize_global_slatedb;
 use crate::utils::get_default_optimizer_rules;
 
 use denormalized_common::error::{DenormalizedError, Result};
 
+/// Thread-safe context acting as a controller.
+///
+/// # Note
+///
+/// 1. Currently serves as a bootstrap controller, not the intended final model.
+/// 2. Custom connector registration may be supported through this type in the
+///    future, but is currently not supported.
 #[derive(Clone)]
 pub struct Context {
     pub session_context: Arc<SessionContext>,
+    /// Registry used to resolve connectors referenced by SQL statements.
+    pub connectors: Arc<ConnectorRegistry>,
 }
 
 impl Context {
@@ -59,6 +70,7 @@ impl Context {
 
         Ok(Self {
             session_context: Arc::new(SessionContext::new_with_state(state)),
+            connectors: Arc::new(ConnectorRegistry::with_builtins()),
         })
     }
 
@@ -67,6 +79,17 @@ impl Context {
         self.register_table(topic_name.clone(), Arc::new(topic))
             .await?;
         let df = self.session_context.table(topic_name.as_str()).await?;
+        let ds = DataStream::new(Arc::new(df), Arc::new(self.clone()));
+        Ok(ds)
+    }
+
+    /// Creates a [`DataStream`] from a [`SessionContext`] registered table.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if table is not registered.
+    pub async fn from_table(&self, table: &str) -> Result<DataStream, DenormalizedError> {
+        let df = self.session_context.table(table).await?;
         let ds = DataStream::new(Arc::new(df), Arc::new(self.clone()));
         Ok(ds)
     }
@@ -85,5 +108,20 @@ impl Context {
     pub async fn with_slatedb_backend(self, path: String) -> Self {
         let _ = initialize_global_slatedb(path.as_str()).await;
         self
+    }
+
+    /// Executes a single SQL statement against this [`Context`].
+    ///
+    /// Returns a [`DataStream`] representing the query output. For DDL
+    /// statements such as `CREATE TABLE`, the returned stream is empty because
+    /// the statement only registers a table.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the SQL cannot be parsed, the statement is not
+    /// supported, connector resolution or source creation fails, or table
+    /// registration fails.
+    pub async fn execute_sql(&self, sql: &str) -> Result<DataStream> {
+        execute_sql(self, sql).await
     }
 }

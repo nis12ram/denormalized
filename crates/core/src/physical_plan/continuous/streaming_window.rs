@@ -415,7 +415,7 @@ impl ExecutionPlan for StreamingWindowExec {
             .extensions
             .get::<DenormalizedConfig>();
 
-        let checkpoint = config_options.map_or(false, |c| c.checkpoint);
+        let checkpoint = config_options.is_some_and(|c| c.checkpoint);
 
         let channel_tag = if checkpoint {
             let node_id = self

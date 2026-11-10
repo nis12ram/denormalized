@@ -4,7 +4,7 @@ use datafusion::functions_aggregate::count::count;
 use datafusion::functions_aggregate::expr_fn::{avg, max, min};
 use datafusion::logical_expr::col;
 
-use denormalized::datasource::kafka::{ConnectionOpts, KafkaTopicBuilder};
+use denormalized::connectors::kafka::{KafkaConnectionOpts, KafkaTopicBuilder};
 use denormalized::prelude::*;
 
 use denormalized_examples::get_sample_json;
@@ -29,7 +29,7 @@ async fn main() -> Result<()> {
         .infer_schema_from_json(get_sample_json().as_str())?
         .with_encoding("json")?
         //.with_timestamp(String::from("occurred_at_ms"), TimestampUnit::Int64Millis)
-        .build_reader(ConnectionOpts::from([
+        .build_reader(KafkaConnectionOpts::from([
             ("auto.offset.reset".to_string(), "latest".to_string()),
             ("group.id".to_string(), "sample_pipeline".to_string()),
         ]))

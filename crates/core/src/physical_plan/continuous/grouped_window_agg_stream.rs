@@ -157,7 +157,7 @@ impl GroupedWindowAggStream {
             .extensions
             .get::<DenormalizedConfig>();
 
-        let checkpoint = config_options.map_or(false, |c| c.checkpoint);
+        let checkpoint = config_options.is_some_and(|c| c.checkpoint);
 
         let mut serialized_state: Option<Vec<u8>> = None;
         let mut state_backend = None;
@@ -188,8 +188,7 @@ impl GroupedWindowAggStream {
             state_backend,
         };
 
-        if serialized_state.is_some() {
-            let bytes = serialized_state.unwrap();
+        if let Some(bytes) = serialized_state {
             let state: CheckpointedGroupedWindowAggStream =
                 bincode::deserialize(bytes.as_ref()).unwrap();
             let ranges: Vec<(SystemTime, SystemTime)> = state

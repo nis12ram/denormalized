@@ -12,7 +12,7 @@ use datafusion::logical_expr::{
     ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature,
 };
 
-use denormalized::datasource::kafka::{ConnectionOpts, KafkaTopicBuilder};
+use denormalized::connectors::kafka::{KafkaConnectionOpts, KafkaTopicBuilder};
 use denormalized::prelude::*;
 
 use arrow::array::{ArrayRef, Float64Array};
@@ -38,7 +38,7 @@ async fn main() -> Result<()> {
         .infer_schema_from_json(sample_event.as_str())?
         .with_encoding("json")?
         .with_timestamp(String::from("occurred_at_ms"), TimestampUnit::Int64Millis)
-        .build_reader(ConnectionOpts::from([
+        .build_reader(KafkaConnectionOpts::from([
             ("auto.offset.reset".to_string(), "latest".to_string()),
             ("group.id".to_string(), "sample_pipeline".to_string()),
         ]))
