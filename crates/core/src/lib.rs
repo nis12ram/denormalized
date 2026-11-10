@@ -1,7 +1,7 @@
 pub mod accumulators;
 pub mod config_extensions;
+pub mod connectors;
 pub mod context;
-pub mod datasource;
 pub mod datastream;
 pub mod formats;
 pub mod logical_plan;
@@ -9,6 +9,7 @@ pub mod physical_optimizer;
 pub mod physical_plan;
 pub mod planner;
 pub mod query_planner;
+pub mod sql;
 pub mod state_backend;
 pub mod utils;
 

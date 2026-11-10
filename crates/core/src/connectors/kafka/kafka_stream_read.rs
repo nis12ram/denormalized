@@ -91,7 +91,7 @@ impl PartitionStream for KafkaStreamRead {
             .extensions
             .get::<DenormalizedConfig>();
 
-        let should_checkpoint = config_options.map_or(false, |c| c.checkpoint);
+        let should_checkpoint = config_options.is_some_and(|c| c.checkpoint);
 
         let partition_tag = self
             .assigned_partitions
@@ -243,9 +243,10 @@ impl PartitionStream for KafkaStreamRead {
                         ts_column = Arc::new(array_to_timestamp_array(arr, timestamp_unit.clone()));
                     };
 
-                    let binary_vec = Vec::from_iter(
-                        std::iter::repeat(String::from("no_barrier")).take(ts_column.len()),
-                    );
+                    let binary_vec = Vec::from_iter(std::iter::repeat_n(
+                        String::from("no_barrier"),
+                        ts_column.len(),
+                    ));
                     let barrier_batch_column = StringArray::from(binary_vec);
 
                     let ts_array = ts_column

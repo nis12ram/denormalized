@@ -24,7 +24,8 @@ use rdkafka::consumer::StreamConsumer;
 use rdkafka::producer::FutureProducer;
 use rdkafka::ClientConfig;
 
-pub type ConnectionOpts = HashMap<String, String>;
+/// Kafka client configuration options forwarded to librdkafka.
+pub type KafkaConnectionOpts = HashMap<String, String>;
 
 /// The configuration for a [`StreamTable`]
 #[derive(Debug)]
@@ -41,7 +42,11 @@ pub struct KafkaReadConfig {
     pub timestamp_column: Option<String>,
     pub timestamp_unit: Option<TimestampUnit>,
 
-    pub kafka_connection_opts: ConnectionOpts,
+    /// Options passed directly to [`rdkafka`].
+    ///
+    /// [`librdkafka` options](https://github.com/edenhill/librdkafka/blob/master/CONFIGURATION.md)
+    /// used to configure the Kafka consumer.
+    pub kafka_connection_opts: KafkaConnectionOpts,
 }
 
 impl KafkaReadConfig {
@@ -80,7 +85,11 @@ pub struct KafkaWriteConfig {
     pub timestamp_column: String,
     pub timestamp_unit: TimestampUnit,
 
-    pub kafka_connection_opts: ConnectionOpts,
+    /// Options passed directly to [`rdkafka`].
+    ///
+    /// [`librdkafka` options](https://github.com/edenhill/librdkafka/blob/master/CONFIGURATION.md)
+    /// used to configure the Kafka producer.
+    pub kafka_connection_opts: KafkaConnectionOpts,
 }
 
 impl KafkaWriteConfig {
@@ -213,7 +222,7 @@ impl KafkaTopicBuilder {
         Ok(Arc::new(Schema::new(fields)))
     }
 
-    pub async fn build_reader(&self, opts: ConnectionOpts) -> Result<TopicReader> {
+    pub async fn build_reader(&self, opts: KafkaConnectionOpts) -> Result<TopicReader> {
         let topic = self
             .topic
             .as_ref()
@@ -237,7 +246,7 @@ impl KafkaTopicBuilder {
 
         let timestamp_unit = self.timestamp_unit.clone();
 
-        let mut kafka_connection_opts = ConnectionOpts::new();
+        let mut kafka_connection_opts = KafkaConnectionOpts::new();
         for (key, value) in opts.into_iter() {
             kafka_connection_opts.insert(key.clone(), value.clone());
         }
@@ -267,7 +276,7 @@ impl KafkaTopicBuilder {
         Ok(TopicReader(Arc::new(config)))
     }
 
-    pub async fn build_writer(&self, opts: ConnectionOpts) -> Result<TopicWriter> {
+    pub async fn build_writer(&self, opts: KafkaConnectionOpts) -> Result<TopicWriter> {
         let topic = self
             .topic
             .as_ref()
@@ -297,7 +306,7 @@ impl KafkaTopicBuilder {
             .ok_or_else(|| DenormalizedError::KafkaConfig("timestamp_unit required".to_string()))?
             .clone();
 
-        let mut kafka_connection_opts = ConnectionOpts::new();
+        let mut kafka_connection_opts = KafkaConnectionOpts::new();
         for (key, value) in opts.into_iter() {
             kafka_connection_opts.insert(key.clone(), value.clone());
         }
@@ -322,18 +331,34 @@ impl KafkaTopicBuilder {
     }
 }
 
+/// Fetches the partition count for `topic`.
+///
+/// # Errors
+///
+/// Returns an error if the Kafka consumer cannot be created, metadata cannot be
+/// fetched, or the topic is not present in the metadata response.
 fn get_topic_partition_count(bootstrap_servers: String, topic: String) -> Result<i32> {
     let mut client_config = ClientConfig::new();
     client_config.set("bootstrap.servers", bootstrap_servers.to_string());
 
-    let consumer: StreamConsumer = client_config.create().expect("Consumer creation failed");
+    // TODO: Apply kafka connection options during metadata discovery
+
+    let consumer: StreamConsumer = client_config.create().map_err(|err| {
+        DenormalizedError::KafkaConfig(format!("consumer creation failed: {err}"))
+    })?;
 
     let data = consumer
         .fetch_metadata(Some(topic.as_str()), Duration::from_millis(5_000))
-        .unwrap();
-    let topic_metadata = data.topics();
-    let md = &topic_metadata[0];
-    let partitions = md.partitions();
+        .map_err(|err| {
+            DenormalizedError::KafkaConfig(format!(
+                "failed to fetch metadata for topic '{topic}': {err}"
+            ))
+        })?;
 
-    Ok(partitions.len() as i32)
+    let md = data
+        .topics()
+        .first()
+        .ok_or_else(|| DenormalizedError::KafkaConfig(format!("topic '{topic}' not found")))?;
+
+    Ok(md.partitions().len() as i32)
 }

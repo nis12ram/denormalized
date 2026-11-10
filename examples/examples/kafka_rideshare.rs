@@ -3,7 +3,7 @@ use datafusion::functions_aggregate::count::count;
 use datafusion::functions_aggregate::expr_fn::{max, min};
 use datafusion::logical_expr::col;
 
-use denormalized::datasource::kafka::{ConnectionOpts, KafkaTopicBuilder};
+use denormalized::connectors::kafka::{KafkaConnectionOpts, KafkaTopicBuilder};
 use denormalized::prelude::*;
 
 use std::time::Duration;
@@ -61,7 +61,7 @@ async fn main() -> Result<()> {
     let source_topic = topic_builder
         .with_topic(String::from("driver-imu-data"))
         .infer_schema_from_json(sample_event)?
-        .build_reader(ConnectionOpts::from([
+        .build_reader(KafkaConnectionOpts::from([
             ("auto.offset.reset".to_string(), "earliest".to_string()),
             ("group.id".to_string(), "test".to_string()),
         ]))

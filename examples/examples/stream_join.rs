@@ -4,7 +4,7 @@ use datafusion::common::JoinType;
 use datafusion::functions_aggregate::average::avg;
 use datafusion::logical_expr::col;
 
-use denormalized::datasource::kafka::{ConnectionOpts, KafkaTopicBuilder};
+use denormalized::connectors::kafka::{KafkaConnectionOpts, KafkaTopicBuilder};
 use denormalized::prelude::*;
 
 use denormalized_examples::get_sample_json;
@@ -28,7 +28,7 @@ async fn main() -> Result<()> {
     let temperature_topic = source_topic_builder
         .clone()
         .with_topic(String::from("temperature"))
-        .build_reader(ConnectionOpts::from([
+        .build_reader(KafkaConnectionOpts::from([
             ("auto.offset.reset".to_string(), "latest".to_string()),
             ("group.id".to_string(), "sample_pipeline".to_string()),
         ]))
@@ -39,7 +39,7 @@ async fn main() -> Result<()> {
             source_topic_builder
                 .clone()
                 .with_topic(String::from("humidity"))
-                .build_reader(ConnectionOpts::from([
+                .build_reader(KafkaConnectionOpts::from([
                     ("auto.offset.reset".to_string(), "latest".to_string()),
                     ("group.id".to_string(), "sample_pipeline".to_string()),
                 ]))

@@ -2,8 +2,8 @@ use pyo3::prelude::*;
 
 use std::sync::Arc;
 
+use denormalized::connectors::kafka::{KafkaConnectionOpts, KafkaTopicBuilder};
 use denormalized::context::Context;
-use denormalized::datasource::kafka::{ConnectionOpts, KafkaTopicBuilder};
 use denormalized::datastream::DataStream;
 use denormalized::physical_plan::utils::time::TimestampUnit;
 
@@ -101,7 +101,7 @@ impl PyContext {
                     .with_encoding("json")?
                     .with_topic(topic)
                     .infer_schema_from_json(sample_json.as_str())?
-                    .build_reader(ConnectionOpts::from([
+                    .build_reader(KafkaConnectionOpts::from([
                         ("auto.offset.reset".to_string(), "latest".to_string()),
                         ("group.id".to_string(), group_id.to_string()),
                     ]))
